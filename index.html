@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>拉海诺方块 AI 演示台</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #1a1a24; color: #e0e0e0; margin: 0; padding: 20px; display: flex; gap: 20px; justify-content: center; }
+        .panel { background: #2a2a36; padding: 20px; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.4); display: flex; flex-direction: column; }
+        h2 { margin-top: 0; font-size: 1.1rem; border-bottom: 1px solid #444; padding-bottom: 10px; color: #fff; }
+        
+        /* 主棋盘 */
+        .board { display: grid; grid-template-columns: repeat(8, 40px); grid-gap: 2px; border: 2px solid #555; padding: 2px; width: max-content; margin-bottom: 10px;}
+        .cell { width: 40px; height: 40px; background: #3a3a4c; cursor: pointer; border-radius: 3px; transition: 0.2s; }
+        .cell.filled { background: #ffd043; box-shadow: inset 0 0 8px rgba(255,160,0,0.6); }
+        .cell.highlight { background: #00ffcc; box-shadow: 0 0 10px #00ffcc; transform: scale(0.95); border-radius: 6px; } /* 回放时即将落下的方块 */
+        
+        /* 绘制板与图鉴库 */
+        .drawer { display: grid; grid-template-columns: repeat(5, 25px); grid-gap: 2px; border: 2px solid #00ffcc; padding: 2px; width: max-content; margin: 0 auto 10px auto;}
+        .drawer .cell { width: 25px; height: 25px; background: #222; }
+        .drawer .cell.active { background: #00ffcc; }
+        
+        .library-container { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 15px; max-width: 250px; min-height: 40px;}
+        .lib-item { border: 1px solid #666; padding: 4px; background: #111; cursor: pointer; border-radius: 4px; }
+        .lib-item:hover { border-color: #00ffcc; }
+        .lib-item .mini-grid { display: grid; grid-gap: 1px; }
+        .mini-cell { width: 8px; height: 8px; background: #00ffcc; border-radius: 1px; }
+        
+        /* 队列槽位 */
+        .queue-container { display: flex; gap: 10px; margin-bottom: 15px; }
+        .slot { width: 50px; height: 50px; border: 1px dashed #666; background: #1a1a24; border-radius: 4px; display: flex; align-items: center; justify-content: center; position: relative; cursor: pointer; }
+        .slot:hover { border-color: #ff4757; }
+        .slot-content { display: grid; grid-gap: 1px; }
+        .slot-index { position: absolute; top: -8px; left: -8px; background: #ff4757; color: white; font-size: 10px; width: 18px; height: 18px; text-align: center; line-height: 18px; border-radius: 50%; font-weight: bold;}
+        
+        .btn-group { display: flex; gap: 10px; margin-bottom: 15px; }
+        button { flex: 1; padding: 10px; background: #3d3d5c; color: white; border: none; border-radius: 4px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+        button:hover { background: #5c5c8a; }
+        button.primary { background: #ff4757; }
+        button.primary:hover { background: #ff6b81; }
+        button.action { background: #00b894; }
+        button.action:hover { background: #00cec9; }
+        
+        /* 播放器模式控制器 */
+        #playbackPanel { display: none; background: #1e272e; padding: 15px; border-radius: 8px; border: 1px solid #00ffcc; margin-top: 15px;}
+        .step-indicator { display: flex; justify-content: space-between; margin-bottom: 10px; font-weight: bold; color: #00ffcc;}
+    </style>
+</head>
+<body>
+
+<div class="panel">
+    <h2>1. 游戏主棋盘 (动态交互)</h2>
+    <div class="board" id="boardGrid"></div>
+    <div class="btn-group" id="boardControls">
+        <button onclick="clearBoard()">清空主棋盘</button>
+    </div>
+    
+    <div id="playbackPanel">
+        <div class="step-indicator" id="stepInfo">准备回放...</div>
+        <button class="action" style="width: 100%; font-size:1.1rem; padding: 15px;" id="btnNextStep" onclick="playNextStep()">▶ 放置方块并演算消除</button>
+    </div>
+</div>
+
+<div class="panel" style="width: 300px;">
+    <div style="background: #1e1e2f; padding: 10px; border-radius: 6px; margin-bottom: 15px; border: 1px solid #00ffcc;">
+        <h3 style="margin: 0 0 10px 0; font-size: 1rem; color: #00ffcc;">⚡ CV 视觉引擎</h3>
+        <div class="btn-group" style="margin-bottom: 8px;">
+            <button onclick="setCaptureBbox()" style="background: #34495e;">框选预备区</button>
+            <button onclick="autoRecognize()" class="action">识别预备区</button>
+        </div>
+        <div class="btn-group" style="margin-bottom: 0;">
+            <button onclick="setBoardBbox()" style="background: #34495e;">框选棋盘</button>
+            <button onclick="autoRecognizeBoard()" class="action">识别棋盘</button>
+        </div>
+    </div>
+
+    <h2>2. 方块建模绘制 (5x5)</h2>
+    <div class="drawer" id="drawerGrid"></div>
+    <div class="btn-group">
+        <button onclick="clearDrawer()">清空画板</button>
+        <button class="action" onclick="saveToLibrary()">⭐ 存入图鉴</button>
+        <button class="primary" onclick="pushToQueueFromDrawer()">加队列 ⬇</button>
+    </div>
+    
+    <h2>3. 常用图鉴库 (点击入列)</h2>
+    <div class="library-container" id="patternLibrary"></div>
+    
+    <h2>4. 本回合预备队列</h2>
+    <div class="queue-container" id="queueSlots"></div>
+    
+    <button class="primary" id="btnSolve" onclick="runEngine()" style="padding: 15px; font-size: 1.1rem;">🚀 执行拓扑演算</button>
+
+    <pre id="log" style="margin-top: 12px; background: #111; border: 1px solid #333; border-radius: 6px; padding: 10px; min-height: 110px; max-height: 160px; overflow-y: auto; white-space: pre-wrap; color: #9ad9ff; font-size: 12px;">[系统] 日志已就绪。
+</pre>
+</div>
+
+<script>
+    // --- 状态数据 ---
+    let boardState = Array(8).fill().map(() => Array(8).fill(0));
+    let drawerState = Array(5).fill().map(() => Array(5).fill(0));
+    let savedPatterns = []; // 存储坐标集的数组
+    let currentBlocks = []; // 当前队列 0~4
+    
+    // 回放引擎状态
+    let playbackSteps = [];
+    let currentStepIndex = 0;
+    let isPlaying = false;
+    let tempRenderBoard = []; // 用于动画渲染的临时棋盘
+
+    // --- 初始化组件 ---
+    const boardGridEl = document.getElementById('boardGrid');
+    const drawerGridEl = document.getElementById('drawerGrid');
+
+    function renderBoard(customBoard = null, highlightCoords = []) {
+        boardGridEl.innerHTML = '';
+        const targetBoard = customBoard || boardState;
+        
+        for(let r=0; r<8; r++) {
+            for(let c=0; c<8; c++) {
+                const cell = document.createElement('div');
+                cell.className = 'cell';
+                
+                // 检查是否为高亮块
+                const isHighlight = highlightCoords.some(pt => pt[0] === r && pt[1] === c);
+                if (isHighlight) {
+                    cell.classList.add('highlight');
+                } else if (targetBoard[r][c] === 1) {
+                    cell.classList.add('filled');
+                }
+
+                // 只有在非播放模式下才允许手动修改棋盘
+                if(!isPlaying) {
+                    cell.onclick = () => { targetBoard[r][c] ^= 1; renderBoard(); };
+                }
+                boardGridEl.appendChild(cell);
+            }
+        }
+    }
+    
+    function clearBoard() { boardState = Array(8).fill().map(() => Array(8).fill(0)); renderBoard(); }
+
+    function renderDrawer() {
+        drawerGridEl.innerHTML = '';
+        for(let r=0; r<5; r++) {
+            for(let c=0; c<5; c++) {
+                const cell = document.createElement('div');
+                cell.className = `cell ${drawerState[r][c] ? 'active' : ''}`;
+                cell.onclick = () => { drawerState[r][c] ^= 1; renderDrawer(); };
+                drawerGridEl.appendChild(cell);
+            }
+        }
+    }
+    function clearDrawer() { drawerState = Array(5).fill().map(() => Array(5).fill(0)); renderDrawer(); }
+
+    // 提取坐标
+    function extractNormalizedCoordinates() {
+        let minR = 99, minC = 99;
+        let coords = [];
+        for(let r=0; r<5; r++) {
+            for(let c=0; c<5; c++) {
+                if(drawerState[r][c] === 1) {
+                    coords.push([r, c]);
+                    if(r < minR) minR = r;
+                    if(c < minC) minC = c;
+                }
+            }
+        }
+        if(coords.length === 0) return [];
+        return coords.map(([r, c]) => [r - minR, c - minC]);
+    }
+
+    // --- 图鉴系统 ---
+    function renderLibrary() {
+        const libEl = document.getElementById('patternLibrary');
+        libEl.innerHTML = '';
+        savedPatterns.forEach((coords, idx) => {
+            const item = document.createElement('div');
+            item.className = 'lib-item';
+            item.title = "点击加入队列";
+            item.onclick = () => pushToQueueDirectly(coords);
+            
+            let maxR = 0, maxC = 0;
+            coords.forEach(pt => { if(pt[0]>maxR) maxR=pt[0]; if(pt[1]>maxC) maxC=pt[1]; });
+            
+            const miniGrid = document.createElement('div');
+            miniGrid.className = 'mini-grid';
+            miniGrid.style.gridTemplateColumns = `repeat(${maxC + 1}, 8px)`;
+            miniGrid.style.gridTemplateRows = `repeat(${maxR + 1}, 8px)`;
+            
+            for(let r=0; r<=maxR; r++) {
+                for(let c=0; c<=maxC; c++) {
+                    const mCell = document.createElement('div');
+                    if(coords.some(pt => pt[0]===r && pt[1]===c)) mCell.className = 'mini-cell';
+                    miniGrid.appendChild(mCell);
+                }
+            }
+            item.appendChild(miniGrid);
+            libEl.appendChild(item);
+        });
+    }
+
+    function saveToLibrary() {
+        const coords = extractNormalizedCoordinates();
+        if(coords.length === 0) return alert("空画板不能保存");
+        savedPatterns.push(coords);
+        renderLibrary();
+        clearDrawer();
+    }
+
+    // --- 队列系统 ---
+    function pushToQueueFromDrawer() {
+        const coords = extractNormalizedCoordinates();
+        if(coords.length === 0) return;
+        pushToQueueDirectly(coords);
+        clearDrawer();
+    }
+    function pushToQueueDirectly(coords) {
+        if(currentBlocks.length >= 4) return alert("队列已满！");
+        currentBlocks.push(coords);
+        renderQueue();
+    }
+    function removeBlock(index) {
+        if(!isPlaying && currentBlocks[index]) {
+            currentBlocks.splice(index, 1);
+            renderQueue();
+        }
+    }
+
+    function renderQueue() {
+        const queueEl = document.getElementById('queueSlots');
+        queueEl.innerHTML = '';
+        for(let i=0; i<4; i++) {
+            const slot = document.createElement('div');
+            slot.className = 'slot';
+            slot.onclick = () => removeBlock(i);
+            
+            if(currentBlocks[i]) {
+                const indexBadge = document.createElement('div');
+                indexBadge.className = 'slot-index';
+                indexBadge.innerText = i + 1;
+                slot.appendChild(indexBadge);
+                
+                const coords = currentBlocks[i];
+                let maxR = 0, maxC = 0;
+                coords.forEach(pt => { if(pt[0]>maxR) maxR=pt[0]; if(pt[1]>maxC) maxC=pt[1]; });
+                
+                const content = document.createElement('div');
+                content.className = 'slot-content';
+                content.style.gridTemplateColumns = `repeat(${maxC + 1}, 8px)`;
+                content.style.gridTemplateRows = `repeat(${maxR + 1}, 8px)`;
+                for(let r=0; r<=maxR; r++) {
+                    for(let c=0; c<=maxC; c++) {
+                        const mCell = document.createElement('div');
+                        if(coords.some(pt => pt[0]===r && pt[1]===c)) mCell.className = 'mini-cell';
+                        content.appendChild(mCell);
+                    }
+                }
+                slot.appendChild(content);
+            } else {
+                slot.innerText = '+'; slot.style.color = '#555';
+            }
+            queueEl.appendChild(slot);
+        }
+    }
+
+    // --- CV 视觉引擎逻辑 ---
+    async function setCaptureBbox() {
+        const logEl = document.getElementById('log');
+        logEl.innerHTML += "[系统] 正在呼出全屏框选层...\n";
+        try {
+            const res = await fetch('http://127.0.0.1:8000/api/set_bbox');
+            const data = await res.json();
+            if(data.status === 'success') {
+                logEl.innerHTML += `✅ ${data.msg}\n`;
+            } else {
+                logEl.innerHTML += `❌ ${data.msg}\n`;
+            }
+        } catch(e) {
+            logEl.innerHTML += `🚨 网络错误: ${e.message}\n`;
+        }
+    }
+
+    async function setBoardBbox() {
+        const logEl = document.getElementById('log');
+        logEl.innerHTML += "[系统] 请框选游戏棋盘区域（整个8×8网格）...\n";
+        try {
+            const res = await fetch('http://127.0.0.1:8000/api/set_board_bbox');
+            const data = await res.json();
+            logEl.innerHTML += (data.status === 'success' ? `✅ ${data.msg}\n` : `❌ ${data.msg}\n`);
+        } catch(e) {
+            logEl.innerHTML += `🚨 网络错误: ${e.message}\n`;
+        }
+    }
+
+    async function autoRecognizeBoard() {
+        const logEl = document.getElementById('log');
+        logEl.innerHTML += "[系统] 正在截取并识别棋盘...\n";
+        try {
+            const startT = performance.now();
+            const res = await fetch('http://127.0.0.1:8000/api/recognize_board');
+            const data = await res.json();
+            const costT = (performance.now() - startT).toFixed(2);
+            if(data.status === 'success') {
+                boardState = data.board;
+                renderBoard();
+                logEl.innerHTML += `✅ 棋盘识别成功，耗时 ${costT} ms，共 ${data.filled_count} 格有方块。\n`;
+            } else {
+                logEl.innerHTML += `❌ ${data.msg}\n`;
+            }
+        } catch(e) {
+            logEl.innerHTML += `🚨 网络错误: ${e.message}\n`;
+        }
+    }
+
+    async function autoRecognize() {
+        const logEl = document.getElementById('log');
+        logEl.innerHTML += "[系统] 静默截取并分析拓扑...\n";
+        try {
+            const startT = performance.now();
+            const res = await fetch('http://127.0.0.1:8000/api/auto_recognize');
+            const data = await res.json();
+            const costT = (performance.now() - startT).toFixed(2);
+            
+            if(data.status === 'success') {
+                logEl.innerHTML += `✅ 识别成功，耗时 ${costT} ms。\n`;
+                // 直接覆盖当前队列
+                currentBlocks = data.blocks;
+                renderQueue();
+                logEl.innerHTML += `[系统] 已将 4 个方块推入预备队列，可立即执行演算。\n`;
+                return true;
+            } else {
+                logEl.innerHTML += `❌ ${data.msg}\n`;
+                return false;
+            }
+        } catch(e) {
+            logEl.innerHTML += `🚨 网络错误: ${e.message}\n`;
+            return false;
+        }
+    }
+
+    // --- 回放引擎核心逻辑 ---
+    async function runEngine() {
+        if(currentBlocks.length !== 4) return alert("必须放满 4 个方块才能演算！");
+        
+        document.getElementById('btnSolve').innerText = "演算中...";
+        
+        try {
+            const res = await fetch('http://127.0.0.1:8000/solve', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ board: boardState, blocks: currentBlocks })
+            });
+            const data = await res.json();
+            
+            document.getElementById('btnSolve').innerText = "🚀 执行拓扑演算";
+
+            if(data.status === 'success') {
+                startPlayback(data.steps);
+            } else {
+                alert(data.msg);
+            }
+        } catch(e) {
+            alert("请求失败: " + e.message);
+            document.getElementById('btnSolve').innerText = "🚀 执行拓扑演算";
+        }
+    }
+
+    function _1dTo2d(arr_1d) {
+        let arr_2d = Array(8).fill().map(() => Array(8).fill(0));
+        for(let i=0; i<64; i++) {
+            arr_2d[Math.floor(i/8)][i%8] = arr_1d[i];
+        }
+        return arr_2d;
+    }
+
+    function startPlayback(steps) {
+        playbackSteps = steps;
+        currentStepIndex = 0;
+        isPlaying = true;
+        
+        // 隐藏常规控件，显示播放控件
+        document.getElementById('boardControls').style.display = 'none';
+        document.getElementById('playbackPanel').style.display = 'block';
+        document.getElementById('btnSolve').disabled = true;
+        
+        prepareStepView();
+    }
+
+    // 准备当前步骤（显示将要掉落的方块高亮）
+    function prepareStepView() {
+        if(currentStepIndex >= 4) {
+            // 本轮结束处理
+            document.getElementById('stepInfo').innerText = "🎉 演算完成！";
+            const btn = document.getElementById('btnNextStep');
+            btn.innerText = "进入下一回合";
+            btn.className = "primary";
+            btn.onclick = finishRound;
+            return;
+        }
+
+        const step = playbackSteps[currentStepIndex];
+        document.getElementById('stepInfo').innerText = `正在演示: 第 ${step.step_order} 步 / 提取方块 ${step.block_index + 1}`;
+        
+        // 解析 1D 数组为 2D 底板 (这是放置该方块前的干净底板)
+        tempRenderBoard = _1dTo2d(step.board_before);
+        
+        // 计算物理绝对坐标，用于前端发光渲染
+        let absCoords = step.coords.map(pt => [pt[0] + step.place_row, pt[1] + step.place_col]);
+        
+        renderBoard(tempRenderBoard, absCoords);
+        
+        const btn = document.getElementById('btnNextStep');
+        btn.innerText = "▶ 确认落下并执行消除";
+        btn.className = "action";
+        btn.onclick = executeStepClear;
+    }
+
+    // 执行当前步骤的消除逻辑，并过渡到下一步
+    function executeStepClear() {
+        const step = playbackSteps[currentStepIndex];
+        
+        // 渲染消除后的棋盘 (无高亮)
+        tempRenderBoard = _1dTo2d(step.board_after);
+        renderBoard(tempRenderBoard, []);
+        
+        // 提示得分
+        if(step.score_gained > 0) {
+            document.getElementById('stepInfo').innerText = `✨ 漂亮！消除得分: +${step.score_gained}`;
+        }
+        
+        currentStepIndex++;
+        
+        const btn = document.getElementById('btnNextStep');
+        btn.innerText = "⏭ 渲染下一个方块";
+        btn.onclick = prepareStepView;
+    }
+
+    // 完成本回合，更新主逻辑，允许新一轮输入
+    async function finishRound() {
+        // 1. 将物理状态同步到主 boardState
+        boardState = _1dTo2d(playbackSteps[3].board_after);
+        
+        // 2. 清理预备队列
+        currentBlocks = [];
+        
+        // 3. 恢复 UI 状态
+        isPlaying = false;
+        document.getElementById('boardControls').style.display = 'flex';
+        document.getElementById('playbackPanel').style.display = 'none';
+        document.getElementById('btnSolve').disabled = false;
+        
+        // 4. 重新渲染
+        renderBoard();
+        renderQueue();
+
+        // 5. 自动衔接下一回合：先识别预备区，再触发演算
+        const logEl = document.getElementById('log');
+        logEl.innerHTML += "[系统] 正在自动识别预备区并执行下一轮演算...\n";
+        const recognized = await autoRecognize();
+        if(!recognized) {
+            logEl.innerHTML += "[系统] 自动流程终止：预备区识别失败，请手动重试。\n";
+            return;
+        }
+
+        if(currentBlocks.length !== 4) {
+            logEl.innerHTML += `[系统] 自动流程终止：识别到 ${currentBlocks.length} 个方块，需 4 个。\n`;
+            return;
+        }
+
+        await runEngine();
+    }
+
+    // 初始化渲染
+    renderBoard();
+    renderDrawer();
+    renderQueue();
+</script>
+</body>
+</html>
