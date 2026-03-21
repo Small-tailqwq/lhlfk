@@ -438,8 +438,12 @@ def _recover_vertical_by_projection(mask, squares, coords, base_side, debug_run_
     return repaired
 
 
-def _detect_blocks_in_crop(crop_img, debug_run_id, slot_idx, tail_img=None):
-    """对单个候选区裁图进行方块识别，返回归一化坐标 [[row, col], ...]"""
+def _detect_blocks_in_crop(crop_img, debug_run_id, slot_idx, tail_img=None, return_details=False):
+    """对单个候选区裁图进行方块识别。
+
+    默认返回归一化坐标 [[row, col], ...]；
+    当 return_details=True 时，返回 {"coords": ..., "cell_points": ...}。
+    """
     img_h, img_w = crop_img.shape[:2]
 
     hsv = cv2.cvtColor(crop_img, cv2.COLOR_BGR2HSV)
@@ -579,14 +583,33 @@ def _detect_blocks_in_crop(crop_img, debug_run_id, slot_idx, tail_img=None):
     step_y = max(float(np.median(y_diffs)) if y_diffs else grid_step, grid_step * 0.75)
 
     coord_set = set()
+    cell_point_map = {}
     for sq in squares:
         col = int(round((sq['cx'] - min_x) / step_x))
         row = int(round((sq['cy'] - min_y) / step_y))
         coord_set.add((row, col))
+        cell_point_map.setdefault((row, col), []).append((sq['cx'], sq['cy']))
 
     coords = [[r, c] for (r, c) in sorted(coord_set, key=lambda t: (t[0], t[1]))]
     coords = _recover_vertical_by_projection(mask, squares, coords, base_side, debug_run_id, slot_idx)
-    return _recover_vertical_tail_cell(crop_img, tail_img, squares, coords, base_side, debug_run_id, slot_idx)
+    coords = _recover_vertical_tail_cell(crop_img, tail_img, squares, coords, base_side, debug_run_id, slot_idx)
+
+    if not return_details:
+        return coords
+
+    # 记录每个归一化格子的局部像素中心；补偿新增格子用步长估算中心。
+    cell_points = []
+    for row, col in coords:
+        samples = cell_point_map.get((row, col), [])
+        if samples:
+            avg_x = int(round(float(np.mean([p[0] for p in samples]))))
+            avg_y = int(round(float(np.mean([p[1] for p in samples]))))
+        else:
+            avg_x = int(round(min_x + col * step_x))
+            avg_y = int(round(min_y + row * step_y))
+        cell_points.append({"row": int(row), "col": int(col), "cx": avg_x, "cy": avg_y})
+
+    return {"coords": coords, "cell_points": cell_points}
 
 
 def extract_blocks_from_memory(bbox):
@@ -636,3 +659,59 @@ def extract_blocks_from_memory(bbox):
     _save_tmp_step(debug_run_id, "06_crop_regions", crop_vis)
 
     return final_blocks
+
+
+def extract_blocks_with_screen_points(bbox):
+    """识别 4 个槽位并返回每个格子的屏幕坐标，用于拖放执行器。"""
+    pil_img = ImageGrab.grab(bbox=bbox)
+    img_np = np.array(pil_img)
+    img_cv2 = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    debug_run_id = _new_debug_run_id("exec")
+
+    img_h, img_w = img_cv2.shape[:2]
+    slot_h = img_w
+    gap_h = (img_h - slot_h * 4) / 3.0
+    extra_h = int(slot_h * 0.35)
+
+    abs_x1 = int(bbox[0])
+    abs_y1 = int(bbox[1])
+
+    slot_details = []
+    for i in range(4):
+        y1 = int(round(i * (slot_h + gap_h)))
+        y2_base = int(round(y1 + slot_h))
+        y2_tail = min(y2_base + extra_h, img_h)
+
+        crop = img_cv2[y1:y2_base, 0:img_w]
+        tail = img_cv2[y2_base:y2_tail, 0:img_w]
+        detail = _detect_blocks_in_crop(
+            crop,
+            debug_run_id,
+            i,
+            tail_img=tail,
+            return_details=True,
+        )
+
+        coords = detail["coords"]
+        cell_points = []
+        for p in detail["cell_points"]:
+            cell_points.append({
+                "row": int(p["row"]),
+                "col": int(p["col"]),
+                "x": int(abs_x1 + p["cx"]),
+                "y": int(abs_y1 + y1 + p["cy"]),
+            })
+
+        slot_details.append({
+            "slot_index": i,
+            "coords": coords,
+            "cell_points": cell_points,
+            "slot_bbox": [
+                int(abs_x1),
+                int(abs_y1 + y1),
+                int(abs_x1 + img_w),
+                int(abs_y1 + y2_base),
+            ],
+        })
+
+    return slot_details

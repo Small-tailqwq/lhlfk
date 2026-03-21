@@ -88,6 +88,8 @@
     <div class="queue-container" id="queueSlots"></div>
     
     <button class="primary" id="btnSolve" onclick="runEngine()" style="padding: 15px; font-size: 1.1rem;">🚀 执行拓扑演算</button>
+    <button class="action" id="btnExecute" onclick="toggleAgentMode()" style="padding: 12px; font-size: 1rem; margin-top: 8px; width: 100%;">🤖 启动代理模式</button>
+    <div style="margin-top: 6px; font-size: 12px; color: #ffd166;">代理模式会自动循环「识别→推导→执行」，默认停止热键为 F8。若游戏是管理员权限，后端也必须管理员权限。</div>
 
     <pre id="log" style="margin-top: 12px; background: #111; border: 1px solid #333; border-radius: 6px; padding: 10px; min-height: 110px; max-height: 160px; overflow-y: auto; white-space: pre-wrap; color: #9ad9ff; font-size: 12px;">[系统] 日志已就绪。
 </pre>
@@ -105,6 +107,11 @@
     let currentStepIndex = 0;
     let isPlaying = false;
     let tempRenderBoard = []; // 用于动画渲染的临时棋盘
+    let agentModeRunning = false;
+    let agentPollTimer = null;
+    let lastAgentCountdown = -1;
+    let lastAgentCycle = 0;
+    let lastAgentError = '';
 
     // --- 初始化组件 ---
     const boardGridEl = document.getElementById('boardGrid');
@@ -364,6 +371,129 @@
         }
     }
 
+    function _updateAgentButton(agent = null) {
+        const btn = document.getElementById('btnExecute');
+        if(agentModeRunning) {
+            const hotkey = (agent && agent.stop_hotkey) ? agent.stop_hotkey : 'F8';
+            if(agent && agent.phase === 'countdown' && agent.countdown_left > 0) {
+                btn.innerText = `⏳ 倒计时 ${agent.countdown_left}s（${hotkey} 停止）`;
+            } else {
+                btn.innerText = `⏹ 停止代理模式（${hotkey}）`;
+            }
+            btn.className = 'primary';
+        } else {
+            btn.innerText = '🤖 启动代理模式';
+            btn.className = 'action';
+        }
+    }
+
+    function _stopAgentPolling() {
+        if(agentPollTimer) {
+            clearInterval(agentPollTimer);
+            agentPollTimer = null;
+        }
+    }
+
+    function _startAgentPolling() {
+        _stopAgentPolling();
+        agentPollTimer = setInterval(refreshAgentStatus, 450);
+    }
+
+    async function refreshAgentStatus() {
+        const logEl = document.getElementById('log');
+        const wasRunning = agentModeRunning;
+        try {
+            const res = await fetch('http://127.0.0.1:8000/api/agent/status');
+            const data = await res.json();
+            if(data.status !== 'success' || !data.agent) return;
+
+            const agent = data.agent;
+            agentModeRunning = !!agent.running;
+            _updateAgentButton(agent);
+
+            if(agent.phase === 'countdown' && agent.countdown_left !== lastAgentCountdown) {
+                logEl.innerHTML += `[系统] 代理倒计时：${agent.countdown_left} 秒...\n`;
+                lastAgentCountdown = agent.countdown_left;
+            }
+
+            if(agent.cycle_count > lastAgentCycle) {
+                logEl.innerHTML += `✅ 代理完成第 ${agent.cycle_count} 轮自动执行。\n`;
+                lastAgentCycle = agent.cycle_count;
+            }
+
+            if(agent.last_error && agent.last_error !== lastAgentError) {
+                logEl.innerHTML += `⚠️ 代理异常：${agent.last_error}\n`;
+                lastAgentError = agent.last_error;
+            }
+
+            if(wasRunning && !agentModeRunning) {
+                logEl.innerHTML += '[系统] 代理模式已停止。\n';
+                _stopAgentPolling();
+                lastAgentCountdown = -1;
+            }
+        } catch(e) {
+            if(wasRunning) {
+                logEl.innerHTML += `🚨 代理状态查询失败: ${e.message}\n`;
+            }
+        }
+    }
+
+    async function toggleAgentMode() {
+        const logEl = document.getElementById('log');
+        const btn = document.getElementById('btnExecute');
+        btn.disabled = true;
+
+        if(agentModeRunning) {
+            try {
+                const res = await fetch('http://127.0.0.1:8000/api/agent/stop', { method: 'POST' });
+                const data = await res.json();
+                logEl.innerHTML += (data.status === 'success')
+                    ? '[系统] 已发送停止请求，等待代理退出...\n'
+                    : `❌ 停止代理失败：${data.msg}\n`;
+            } catch(e) {
+                logEl.innerHTML += `🚨 停止代理网络错误: ${e.message}\n`;
+            } finally {
+                btn.disabled = false;
+            }
+            return;
+        }
+
+        logEl.innerHTML += '[系统] 代理模式准备启动：3 秒倒计时后自动循环识别、推导与执行。\n';
+        lastAgentCountdown = -1;
+        lastAgentCycle = 0;
+        lastAgentError = '';
+
+        try {
+            const res = await fetch('http://127.0.0.1:8000/api/agent/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    wait_ms: 900,
+                    countdown_sec: 3,
+                    backend: 'auto',
+                    dry_run: false,
+                    timing_profile: 'safe',
+                    stop_hotkey: 'F8'
+                })
+            });
+            const data = await res.json();
+
+            if(data.status === 'success') {
+                agentModeRunning = true;
+                logEl.innerHTML += `✅ ${data.msg}\n`;
+                _startAgentPolling();
+                await refreshAgentStatus();
+            } else {
+                logEl.innerHTML += `❌ 代理模式启动失败：${data.msg}\n`;
+            }
+        } catch(e) {
+            logEl.innerHTML += `🚨 代理模式网络错误: ${e.message}\n`;
+        } finally {
+            btn.disabled = false;
+            _updateAgentButton();
+        }
+    }
+
     function _1dTo2d(arr_1d) {
         let arr_2d = Array(8).fill().map(() => Array(8).fill(0));
         for(let i=0; i<64; i++) {
@@ -473,6 +603,7 @@
     renderBoard();
     renderDrawer();
     renderQueue();
+    refreshAgentStatus();
 </script>
 </body>
 </html>
