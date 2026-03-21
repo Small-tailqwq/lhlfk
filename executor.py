@@ -7,6 +7,15 @@ from vision_core import extract_blocks_with_screen_points
 
 TIMING_PROFILES: Dict[str, Dict[str, float]] = {
     # 优先稳定性，避免游戏漏收鼠标拖放事件。
+    # - pre_press_sec: 鼠标移动到起点后等待的时间
+    # - hold_before_drag_sec: 按下鼠标后等待的时间
+    # - travel_sec: 从起点拖动到终点的时间
+    # - hold_after_arrive_sec: 到达终点后继续按住的时间
+    # - release_settle_sec: 松开鼠标后等待的时间
+    # - inter_step_sec: 步骤间的额外等待时间
+    # - clear_extra_sec: 触发消除后额外等待的时间
+    # - min_steps: 拖动分多少步，步数越多越慢越平滑，反之越快但可能不稳定
+    # - px_per_step: 每步拖动的像素数，数值越小越平滑但越慢，数值越大越快但可能不稳定
     "safe": {
         "pre_press_sec": 0.05,
         "hold_before_drag_sec": 0.08,
@@ -30,15 +39,15 @@ TIMING_PROFILES: Dict[str, Dict[str, float]] = {
         "px_per_step": 60.0,
     },
     "fast": {
-        "pre_press_sec": 0.015,
-        "hold_before_drag_sec": 0.02,
+        "pre_press_sec": 0.02,
+        "hold_before_drag_sec": 0.05,
         "travel_sec": 0.10,
         "hold_after_arrive_sec": 0.015,
         "release_settle_sec": 0.05,
         "inter_step_sec": 0.05,
         "clear_extra_sec": 1.0,
-        "min_steps": 4.0,
-        "px_per_step": 110.0,
+        "min_steps": 5.0,
+        "px_per_step": 80.0,
     },
 }
 
@@ -290,6 +299,54 @@ def _drag_mouse(backend: Dict[str, Any], src: Tuple[int, int], dst: Tuple[int, i
     time.sleep(float(timing["release_settle_sec"]))
 
 
+def _drag_mouse_profiled(
+    backend: Dict[str, Any],
+    src: Tuple[int, int],
+    dst: Tuple[int, int],
+    timing: Dict[str, float],
+) -> Dict[str, float]:
+    started = time.perf_counter()
+    sx, sy = src
+    dx, dy = dst
+
+    backend["move_to"](sx, sy)
+
+    wait_started = time.perf_counter()
+    time.sleep(float(timing["pre_press_sec"]))
+    backend["mouse_down"]()
+    time.sleep(float(timing["hold_before_drag_sec"]))
+    press_wait_ms = (time.perf_counter() - wait_started) * 1000.0
+
+    px_span = max(abs(dx - sx), abs(dy - sy))
+    min_steps = int(round(float(timing["min_steps"])))
+    px_per_step = max(float(timing["px_per_step"]), 1.0)
+    steps = max(min_steps, int(px_span / px_per_step))
+    step_sleep = max(float(timing["travel_sec"]) / max(steps, 1), 0.006)
+
+    move_started = time.perf_counter()
+    for i in range(1, steps + 1):
+        nx = int(round(sx + (dx - sx) * i / steps))
+        ny = int(round(sy + (dy - sy) * i / steps))
+        backend["move_to"](nx, ny)
+        time.sleep(step_sleep)
+    move_ms = (time.perf_counter() - move_started) * 1000.0
+
+    release_started = time.perf_counter()
+    time.sleep(float(timing["hold_after_arrive_sec"]))
+    backend["mouse_up"]()
+    time.sleep(float(timing["release_settle_sec"]))
+    release_wait_ms = (time.perf_counter() - release_started) * 1000.0
+
+    total_ms = (time.perf_counter() - started) * 1000.0
+    return {
+        "drag_total_ms": total_ms,
+        "press_wait_ms": press_wait_ms,
+        "move_ms": move_ms,
+        "release_wait_ms": release_wait_ms,
+        "move_steps": float(steps),
+    }
+
+
 def execute_solution_steps(
     steps: List[Dict[str, Any]],
     capture_bbox: Sequence[int],
@@ -297,7 +354,9 @@ def execute_solution_steps(
     backend: str = "auto",
     dry_run: bool = False,
     timing_profile: str = "safe",
+    enable_profiling: bool = False,
 ) -> Dict[str, Any]:
+    total_started = time.perf_counter()
     if not dry_run and not is_running_as_admin():
         return {
             "status": "fail",
@@ -316,20 +375,27 @@ def execute_solution_steps(
 
     timing = _resolve_timing_profile(timing_profile)
 
+    recognize_started = time.perf_counter()
     slot_details = extract_blocks_with_screen_points(tuple(int(v) for v in capture_bbox))
+    recognize_ms = (time.perf_counter() - recognize_started) * 1000.0
     if len(slot_details) != 4:
         return {"status": "fail", "msg": f"执行器识别异常：检测到 {len(slot_details)} 个槽位，期望 4 个。"}
 
     input_backend = None
     backend_name = "dry-run"
+    backend_load_ms = 0.0
     if not dry_run:
+        backend_started = time.perf_counter()
         input_backend = _load_mouse_backend(backend)
+        backend_load_ms = (time.perf_counter() - backend_started) * 1000.0
         backend_name = input_backend["name"]
 
     actions: List[Dict[str, Any]] = []
+    profile_steps: List[Dict[str, Any]] = []
     ordered_steps = sorted(steps, key=lambda s: int(s.get("step_order", 0)))
 
     for step in ordered_steps:
+        step_started = time.perf_counter()
         block_index = int(step.get("block_index", -1))
         place_row = int(step.get("place_row", 0))
         place_col = int(step.get("place_col", 0))
@@ -352,13 +418,33 @@ def execute_solution_steps(
 
         dst = _board_cell_center(board_bbox, target_row, target_col)
 
+        drag_profile = {
+            "drag_total_ms": 0.0,
+            "press_wait_ms": 0.0,
+            "move_ms": 0.0,
+            "release_wait_ms": 0.0,
+            "move_steps": 0.0,
+        }
+        inter_step_wait_ms = 0.0
+        clear_wait_ms = 0.0
         if not dry_run and input_backend is not None:
-            _drag_mouse(input_backend, src, dst, timing)
+            if enable_profiling:
+                drag_profile = _drag_mouse_profiled(input_backend, src, dst, timing)
+            else:
+                _drag_mouse(input_backend, src, dst, timing)
+
+            inter_wait_started = time.perf_counter()
             time.sleep(float(timing["inter_step_sec"]))
+            inter_step_wait_ms = (time.perf_counter() - inter_wait_started) * 1000.0
+
             score_gained = int(step.get("score_gained", 0) or 0)
             if score_gained > 0:
                 # 触发消除后棋盘会短暂锁定，额外等待以避免下一步被吞。
+                clear_wait_started = time.perf_counter()
                 time.sleep(float(timing["clear_extra_sec"]))
+                clear_wait_ms = (time.perf_counter() - clear_wait_started) * 1000.0
+        else:
+            score_gained = int(step.get("score_gained", 0) or 0)
 
         actions.append(
             {
@@ -372,10 +458,40 @@ def execute_solution_steps(
             }
         )
 
-    return {
+        if enable_profiling:
+            profile_steps.append(
+                {
+                    "step_order": int(step.get("step_order", len(actions))),
+                    "block_index": block_index,
+                    "drag_total_ms": round(float(drag_profile["drag_total_ms"]), 3),
+                    "press_wait_ms": round(float(drag_profile["press_wait_ms"]), 3),
+                    "move_ms": round(float(drag_profile["move_ms"]), 3),
+                    "release_wait_ms": round(float(drag_profile["release_wait_ms"]), 3),
+                    "inter_step_wait_ms": round(float(inter_step_wait_ms), 3),
+                    "clear_wait_ms": round(float(clear_wait_ms), 3),
+                    "move_steps": int(round(float(drag_profile["move_steps"]))),
+                    "step_total_ms": round((time.perf_counter() - step_started) * 1000.0, 3),
+                }
+            )
+
+    result = {
         "status": "success",
         "backend": backend_name,
         "dry_run": bool(dry_run),
         "timing_profile": str(timing_profile or "safe").lower(),
         "actions": actions,
     }
+
+    if enable_profiling:
+        result["perf"] = {
+            "enabled": True,
+            "recognize_slots_ms": round(recognize_ms, 3),
+            "load_backend_ms": round(backend_load_ms, 3),
+            "steps": profile_steps,
+            "drag_total_ms": round(sum(item["drag_total_ms"] for item in profile_steps), 3),
+            "inter_step_wait_total_ms": round(sum(item["inter_step_wait_ms"] for item in profile_steps), 3),
+            "clear_wait_total_ms": round(sum(item["clear_wait_ms"] for item in profile_steps), 3),
+            "execute_total_ms": round((time.perf_counter() - total_started) * 1000.0, 3),
+        }
+
+    return result

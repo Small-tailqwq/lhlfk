@@ -79,6 +79,27 @@
             <input type="checkbox" id="chkTmpDebug" onchange="onToggleTmpDebug()" />
             输出识别过程图像到 tmp 目录（调试模式）
         </label>
+        <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:13px;">
+            <input type="checkbox" id="chkPerfAnalysis" onchange="onTogglePerfAnalysis()" />
+            性能分析模式（记录各环节耗时到 dataset/perf_log.jsonl）
+        </label>
+        <div style="margin-bottom: 10px;">
+            <label style="font-size: 13px; color: #c7d2e8; display: block; margin-bottom: 6px;">⚡ 执行器模式：</label>
+            <div style="display: flex; gap: 6px;">
+                <label style="display:flex; align-items:center; gap:4px; margin:0; font-size:12px;">
+                    <input type="radio" name="timingProfile" value="safe" onchange="onChangeTimingProfile()" />
+                    <span>Safe（稳定）</span>
+                </label>
+                <label style="display:flex; align-items:center; gap:4px; margin:0; font-size:12px;">
+                    <input type="radio" name="timingProfile" value="balanced" onchange="onChangeTimingProfile()" />
+                    <span>Balanced（均衡）</span>
+                </label>
+                <label style="display:flex; align-items:center; gap:4px; margin:0; font-size:12px;">
+                    <input type="radio" name="timingProfile" value="fast" onchange="onChangeTimingProfile()" />
+                    <span>Fast（激进）</span>
+                </label>
+            </div>
+        </div>
         <div style="font-size: 12px; color: #c7d2e8; line-height: 1.5; margin-bottom: 8px;">
             <div>预备区坐标: <span id="savedCaptureBbox">未保存</span></div>
             <div>棋盘区坐标: <span id="savedBoardBbox">未保存</span></div>
@@ -322,8 +343,41 @@
 
     function renderSettings(settings) {
         document.getElementById('chkTmpDebug').checked = !!settings.tmp_debug_enabled;
+        document.getElementById('chkPerfAnalysis').checked = !!settings.perf_analysis_enabled;
+        const profile = (settings.timing_profile || 'safe').toLowerCase();
+        document.querySelectorAll('input[name="timingProfile"]').forEach(radio => {
+            radio.checked = (radio.value === profile);
+        });
         document.getElementById('savedCaptureBbox').innerText = formatBboxText(settings.current_bbox);
         document.getElementById('savedBoardBbox').innerText = formatBboxText(settings.board_bbox);
+    }
+
+    function formatPerfValue(value) {
+        const num = Number(value);
+        if(!Number.isFinite(num)) return '0.000';
+        return num.toFixed(3);
+    }
+
+    function appendPerfLog(title, perf) {
+        if(!perf) return;
+        const logEl = document.getElementById('log');
+        const parts = [];
+        Object.entries(perf).forEach(([key, value]) => {
+            if(Array.isArray(value) || value === null || typeof value === 'object') return;
+            if(typeof value === 'boolean') return;
+            if(key.endsWith('_ms')) {
+                parts.push(`${key}=${formatPerfValue(value)}ms`);
+            }
+        });
+        if(parts.length > 0) {
+            logEl.innerHTML += `[性能] ${title}: ${parts.join(' | ')}\n`;
+        }
+
+        if(Array.isArray(perf.steps) && perf.steps.length > 0) {
+            perf.steps.forEach(step => {
+                logEl.innerHTML += `[性能] step${step.step_order}: drag=${formatPerfValue(step.drag_total_ms)}ms | inter=${formatPerfValue(step.inter_step_wait_ms)}ms | clear=${formatPerfValue(step.clear_wait_ms)}ms | total=${formatPerfValue(step.step_total_ms)}ms\n`;
+            });
+        }
     }
 
     async function loadSettings(showLog = false) {
@@ -371,6 +425,56 @@
         }
     }
 
+    async function onTogglePerfAnalysis() {
+        const logEl = document.getElementById('log');
+        const enabled = document.getElementById('chkPerfAnalysis').checked;
+        try {
+            const res = await fetch('http://127.0.0.1:8000/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ perf_analysis_enabled: enabled })
+            });
+            const data = await res.json();
+            if(data.status === 'success' && data.settings) {
+                renderSettings(data.settings);
+                logEl.innerHTML += enabled
+                    ? '[系统] 已开启性能分析模式：后续识别/推导/执行耗时将写入 dataset/perf_log.jsonl。\n'
+                    : '[系统] 已关闭性能分析模式。\n';
+            } else {
+                logEl.innerHTML += `❌ 性能分析设置保存失败: ${data.msg || '未知错误'}\n`;
+                await loadSettings(false);
+            }
+        } catch(e) {
+            logEl.innerHTML += `🚨 性能分析设置网络错误: ${e.message}\n`;
+            await loadSettings(false);
+        }
+    }
+
+    async function onChangeTimingProfile() {
+        const logEl = document.getElementById('log');
+        const selected = document.querySelector('input[name="timingProfile"]:checked');
+        if(!selected) return;
+        const profile = selected.value;
+        try {
+            const res = await fetch('http://127.0.0.1:8000/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ timing_profile: profile })
+            });
+            const data = await res.json();
+            if(data.status === 'success' && data.settings) {
+                renderSettings(data.settings);
+                logEl.innerHTML += `[系统] 执行器模式已切换为: ${profile.toUpperCase()}\n`;
+            } else {
+                logEl.innerHTML += `❌ 执行器模式设置保存失败: ${data.msg || '未知错误'}\n`;
+                await loadSettings(false);
+            }
+        } catch(e) {
+            logEl.innerHTML += `🚨 执行器模式设置网络错误: ${e.message}\n`;
+            await loadSettings(false);
+        }
+    }
+
     async function autoRecognizeBoard() {
         const logEl = document.getElementById('log');
         logEl.innerHTML += "[系统] 正在截取并识别棋盘...\n";
@@ -383,8 +487,10 @@
                 boardState = data.board;
                 renderBoard();
                 logEl.innerHTML += `✅ 棋盘识别成功，耗时 ${costT} ms，共 ${data.filled_count} 格有方块。\n`;
+                appendPerfLog('棋盘识别', data.perf);
             } else {
                 logEl.innerHTML += `❌ ${data.msg}\n`;
+                appendPerfLog('棋盘识别失败', data.perf);
             }
         } catch(e) {
             logEl.innerHTML += `🚨 网络错误: ${e.message}\n`;
@@ -406,9 +512,11 @@
                 currentBlocks = data.blocks;
                 renderQueue();
                 logEl.innerHTML += `[系统] 已将 4 个方块推入预备队列，可立即执行演算。\n`;
+                appendPerfLog('预备区识别', data.perf);
                 return true;
             } else {
                 logEl.innerHTML += `❌ ${data.msg}\n`;
+                appendPerfLog('预备区识别失败', data.perf);
                 return false;
             }
         } catch(e) {
@@ -434,8 +542,10 @@
             document.getElementById('btnSolve').innerText = "🚀 执行拓扑演算";
 
             if(data.status === 'success') {
+                appendPerfLog('求解', data.perf);
                 startPlayback(data.steps);
             } else {
+                appendPerfLog('求解失败', data.perf);
                 alert(data.msg);
             }
         } catch(e) {
@@ -491,6 +601,7 @@
 
             if(agent.cycle_count > lastAgentCycle) {
                 logEl.innerHTML += `✅ 代理完成第 ${agent.cycle_count} 轮自动执行。\n`;
+                appendPerfLog(`代理第 ${agent.cycle_count} 轮`, agent.last_profile);
                 lastAgentCycle = agent.cycle_count;
             }
 
@@ -505,9 +616,7 @@
                 lastAgentCountdown = -1;
             }
         } catch(e) {
-            if(wasRunning) {
-                logEl.innerHTML += `🚨 代理状态查询失败: ${e.message}\n`;
-            }
+            // Network error during polling, silently ignore
         }
     }
 
@@ -517,12 +626,18 @@
         btn.disabled = true;
 
         if(agentModeRunning) {
+            // STOP mode
             try {
-                const res = await fetch('http://127.0.0.1:8000/api/agent/stop', { method: 'POST' });
+                const res = await fetch('http://127.0.0.1:8000/api/agent/stop', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
                 const data = await res.json();
-                logEl.innerHTML += (data.status === 'success')
-                    ? '[系统] 已发送停止请求，等待代理退出...\n'
-                    : `❌ 停止代理失败：${data.msg}\n`;
+                if(data.status === 'success') {
+                    logEl.innerHTML += '[系统] 已发送停止请求，等待代理退出...\n';
+                } else {
+                    logEl.innerHTML += `❌ 停止代理失败：${data.msg}\n`;
+                }
             } catch(e) {
                 logEl.innerHTML += `🚨 停止代理网络错误: ${e.message}\n`;
             } finally {
@@ -531,7 +646,10 @@
             return;
         }
 
-        logEl.innerHTML += '[系统] 代理模式准备启动：3 秒倒计时后自动循环识别、推导与执行。\n';
+        // START mode
+        const selectedProfile = document.querySelector('input[name="timingProfile"]:checked');
+        const profile = selectedProfile ? selectedProfile.value : 'safe';
+        logEl.innerHTML += `[系统] 代理模式准备启动（${profile.toUpperCase()}档）：3 秒倒计时后自动循环识别、推导与执行。\n`;
         lastAgentCountdown = -1;
         lastAgentCycle = 0;
         lastAgentError = '';
@@ -545,7 +663,7 @@
                     countdown_sec: 3,
                     backend: 'auto',
                     dry_run: false,
-                    timing_profile: 'safe',
+                    timing_profile: profile,
                     stop_hotkey: 'F8'
                 })
             });
@@ -639,8 +757,14 @@
 
     // 完成本回合，更新主逻辑，允许新一轮输入
     async function finishRound() {
+        const logEl = document.getElementById('log');
+        
         // 1. 将物理状态同步到主 boardState
         boardState = _1dTo2d(playbackSteps[3].board_after);
+        
+        const selectedProfile = document.querySelector('input[name="timingProfile"]:checked');
+        const profile = selectedProfile ? selectedProfile.value : 'safe';
+        logEl.innerHTML += `[系统] 使用 ${profile.toUpperCase()} 档执行本轮演算...\n`;
         
         // 2. 清理预备队列
         currentBlocks = [];
@@ -656,7 +780,6 @@
         renderQueue();
 
         // 5. 自动衔接下一回合：先识别预备区，再触发演算
-        const logEl = document.getElementById('log');
         logEl.innerHTML += "[系统] 正在自动识别预备区并执行下一轮演算...\n";
         const recognized = await autoRecognize();
         if(!recognized) {

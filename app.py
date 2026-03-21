@@ -36,6 +36,7 @@ STOP_HOTKEY_VK = {
 SETTINGS_FILE = Path(__file__).resolve().parent / "app_settings.json"
 DATA_DIR = Path(__file__).resolve().parent / "dataset"
 RECORD_FILE = DATA_DIR / "turn_history.jsonl"
+PERF_LOG_FILE = DATA_DIR / "perf_log.jsonl"
 DATA_LOCK = threading.Lock()
 DATA_DIR.mkdir(exist_ok=True)
 
@@ -79,7 +80,7 @@ def _get_clear_score(lines):
     if lines == 2: return 500
     if lines == 3: return 1000
     if lines == 4: return 1500
-    if lines >= 5: return 1500
+    if lines >= 5: return 2000
     return 0
 
 @njit(fastmath=True, nogil=True)
@@ -330,6 +331,8 @@ class AgentStartRequest(BaseModel):
 
 class SettingsUpdateRequest(BaseModel):
     tmp_debug_enabled: Optional[bool] = None
+    perf_analysis_enabled: Optional[bool] = None
+    timing_profile: Optional[str] = None
 
 
 AGENT_LOCK = threading.Lock()
@@ -346,12 +349,15 @@ AGENT_STATE: Dict[str, Any] = {
     "dry_run": False,
     "timing_profile": "safe",
     "stop_hotkey": "F8",
+    "last_profile": None,
     "thread": None,
 }
 
 # 全局存储框选坐标（支持持久化）
 CURRENT_BBOX = None
 BOARD_BBOX = None
+TIMING_PROFILE_CHOICE = "safe"
+PERF_ANALYSIS_ENABLED = False
 
 
 def _normalize_bbox(value):
@@ -371,6 +377,8 @@ def _normalize_bbox(value):
 def _save_settings():
     payload = {
         "tmp_debug_enabled": bool(get_tmp_debug_enabled()),
+        "timing_profile": str(TIMING_PROFILE_CHOICE),
+        "perf_analysis_enabled": bool(PERF_ANALYSIS_ENABLED),
         "current_bbox": list(CURRENT_BBOX) if CURRENT_BBOX else None,
         "board_bbox": list(BOARD_BBOX) if BOARD_BBOX else None,
     }
@@ -378,7 +386,7 @@ def _save_settings():
 
 
 def _load_settings():
-    global CURRENT_BBOX, BOARD_BBOX
+    global PERF_ANALYSIS_ENABLED, TIMING_PROFILE_CHOICE, CURRENT_BBOX, BOARD_BBOX
 
     if not SETTINGS_FILE.exists():
         set_tmp_debug_enabled(False)
@@ -391,6 +399,10 @@ def _load_settings():
         return
 
     set_tmp_debug_enabled(bool(data.get("tmp_debug_enabled", False)))
+    PERF_ANALYSIS_ENABLED = bool(data.get("perf_analysis_enabled", False))
+    choice = str(data.get("timing_profile", "safe")).lower()
+    if choice in ("safe", "balanced", "fast"):
+        TIMING_PROFILE_CHOICE = choice
     CURRENT_BBOX = _normalize_bbox(data.get("current_bbox"))
     BOARD_BBOX = _normalize_bbox(data.get("board_bbox"))
 
@@ -419,31 +431,92 @@ def _record_turn_data(board_2d, blocks_3d, source: str, solve_result: Optional[D
         pass
 
 
-def _solve_with_steps(board: List[List[int]], blocks: List[List[List[int]]], source: str = "unknown") -> Dict[str, Any]:
+def _round_ms(value: float) -> float:
+    return round(float(value), 3)
+
+
+def _should_profile(explicit: Optional[bool] = None) -> bool:
+    if explicit is not None:
+        return bool(explicit)
+    return bool(PERF_ANALYSIS_ENABLED)
+
+
+def _record_perf_log(event_type: str, payload: Dict[str, Any], enabled: Optional[bool] = None):
+    if not _should_profile(enabled):
+        return
+
+    record = {
+        "timestamp": time.time(),
+        "event": event_type,
+        **payload,
+    }
+    try:
+        with DATA_LOCK:
+            with PERF_LOG_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _solve_with_steps(
+    board: List[List[int]],
+    blocks: List[List[List[int]]],
+    source: str = "unknown",
+    enable_profiling: Optional[bool] = None,
+) -> Dict[str, Any]:
+    profiling_enabled = _should_profile(enable_profiling)
+    total_started = time.perf_counter()
+
     if len(blocks) != 4:
         result = {"status": "fail", "msg": "参数校验失败：必须提供 4 个方块"}
+        if profiling_enabled:
+            result["perf"] = {"enabled": True, "solve_total_ms": _round_ms((time.perf_counter() - total_started) * 1000.0)}
         _record_turn_data(board, blocks, source, result)
+        _record_perf_log("solve", {"source": source, "status": result["status"], "perf": result.get("perf")}, profiling_enabled)
         return result
 
+    board_convert_started = time.perf_counter()
     board_1d = np.array(board, dtype=np.int8).flatten()
+    board_convert_ms = (time.perf_counter() - board_convert_started) * 1000.0
     if board_1d.size != 64:
         result = {"status": "fail", "msg": "参数校验失败：棋盘尺寸必须为 8x8"}
+        if profiling_enabled:
+            result["perf"] = {
+                "enabled": True,
+                "board_convert_ms": _round_ms(board_convert_ms),
+                "solve_total_ms": _round_ms((time.perf_counter() - total_started) * 1000.0),
+            }
         _record_turn_data(board, blocks, source, result)
+        _record_perf_log("solve", {"source": source, "status": result["status"], "perf": result.get("perf")}, profiling_enabled)
         return result
 
+    pieces_pack_started = time.perf_counter()
     pieces_arr = np.full((4, 16, 2), -1, dtype=np.int8)
     for i, block_coords in enumerate(blocks):
         for j, (r, c) in enumerate(block_coords):
             if j < 16:
                 pieces_arr[i, j, 0] = r
                 pieces_arr[i, j, 1] = c
+    pieces_pack_ms = (time.perf_counter() - pieces_pack_started) * 1000.0
 
+    solve_started = time.perf_counter()
     eval_score, game_score, moves = _solve_turn(board_1d, pieces_arr)
+    solve_core_ms = (time.perf_counter() - solve_started) * 1000.0
     if eval_score == NO_SOLUTION_EVAL:
         result = {"status": "fail", "msg": "Game Over：当前盘面下这4个方块无法全部放置。"}
+        if profiling_enabled:
+            result["perf"] = {
+                "enabled": True,
+                "board_convert_ms": _round_ms(board_convert_ms),
+                "pieces_pack_ms": _round_ms(pieces_pack_ms),
+                "solve_core_ms": _round_ms(solve_core_ms),
+                "solve_total_ms": _round_ms((time.perf_counter() - total_started) * 1000.0),
+            }
         _record_turn_data(board, blocks, source, result)
+        _record_perf_log("solve", {"source": source, "status": result["status"], "perf": result.get("perf")}, profiling_enabled)
         return result
 
+    build_steps_started = time.perf_counter()
     steps = []
     current_sim_board = board_1d.copy()
     for move in moves:
@@ -464,6 +537,7 @@ def _solve_with_steps(board: List[List[int]], blocks: List[List[List[int]]], sou
             "board_after": next_board.tolist(),
         })
         current_sim_board = next_board
+    build_steps_ms = (time.perf_counter() - build_steps_started) * 1000.0
 
     result = {
         "status": "success",
@@ -471,7 +545,27 @@ def _solve_with_steps(board: List[List[int]], blocks: List[List[List[int]]], sou
         "evaluation": float(eval_score),
         "steps": steps,
     }
+    if profiling_enabled:
+        result["perf"] = {
+            "enabled": True,
+            "board_convert_ms": _round_ms(board_convert_ms),
+            "pieces_pack_ms": _round_ms(pieces_pack_ms),
+            "solve_core_ms": _round_ms(solve_core_ms),
+            "build_steps_ms": _round_ms(build_steps_ms),
+            "solve_total_ms": _round_ms((time.perf_counter() - total_started) * 1000.0),
+        }
     _record_turn_data(board, blocks, source, result)
+    _record_perf_log(
+        "solve",
+        {
+            "source": source,
+            "status": result["status"],
+            "evaluation": result.get("evaluation"),
+            "game_score_gained": result.get("game_score_gained"),
+            "perf": result.get("perf"),
+        },
+        profiling_enabled,
+    )
     return result
 
 
@@ -508,6 +602,7 @@ def _agent_snapshot() -> Dict[str, Any]:
             "dry_run": bool(AGENT_STATE["dry_run"]),
             "timing_profile": AGENT_STATE["timing_profile"],
             "stop_hotkey": AGENT_STATE["stop_hotkey"],
+            "last_profile": AGENT_STATE["last_profile"],
         }
 
 
@@ -556,15 +651,23 @@ def _agent_worker(
                     break
 
             try:
+                cycle_started = time.perf_counter()
                 if not CURRENT_BBOX or not BOARD_BBOX:
                     raise RuntimeError("代理执行失败：缺少预备区或棋盘框选。")
 
+                board_started = time.perf_counter()
                 board = extract_board_from_memory(BOARD_BBOX)
+                board_ms = (time.perf_counter() - board_started) * 1000.0
+
+                blocks_started = time.perf_counter()
                 blocks = extract_blocks_from_memory(CURRENT_BBOX)
-                solve_result = _solve_with_steps(board, blocks, source="agent")
+                blocks_ms = (time.perf_counter() - blocks_started) * 1000.0
+
+                solve_result = _solve_with_steps(board, blocks, source="agent", enable_profiling=PERF_ANALYSIS_ENABLED)
                 if solve_result.get("status") != "success":
                     raise RuntimeError(solve_result.get("msg", "推导失败"))
 
+                execute_started = time.perf_counter()
                 execute_result = execute_solution_steps(
                     steps=solve_result["steps"],
                     capture_bbox=CURRENT_BBOX,
@@ -572,15 +675,47 @@ def _agent_worker(
                     backend=backend,
                     dry_run=dry_run,
                     timing_profile=timing_profile,
+                    enable_profiling=PERF_ANALYSIS_ENABLED,
                 )
+                execute_ms = (time.perf_counter() - execute_started) * 1000.0
                 if execute_result.get("status") != "success":
                     raise RuntimeError(execute_result.get("msg", "执行失败"))
+
+                cycle_profile = None
+                if PERF_ANALYSIS_ENABLED:
+                    cycle_profile = {
+                        "board_recognize_ms": _round_ms(board_ms),
+                        "block_recognize_ms": _round_ms(blocks_ms),
+                        "solve_ms": _round_ms(solve_result.get("perf", {}).get("solve_total_ms", 0.0)),
+                        "execute_ms": _round_ms(execute_result.get("perf", {}).get("execute_total_ms", execute_ms)),
+                        "cycle_total_ms": _round_ms((time.perf_counter() - cycle_started) * 1000.0),
+                    }
+                    _record_perf_log(
+                        "agent_cycle",
+                        {
+                            "status": "success",
+                            "cycle_count": int(AGENT_STATE["cycle_count"]) + 1,
+                            "profile": cycle_profile,
+                            "solve_perf": solve_result.get("perf"),
+                            "execute_perf": execute_result.get("perf"),
+                        },
+                        True,
+                    )
 
                 with AGENT_LOCK:
                     AGENT_STATE["cycle_count"] += 1
                     AGENT_STATE["last_error"] = ""
                     AGENT_STATE["last_msg"] = f"第 {AGENT_STATE['cycle_count']} 轮完成。"
+                    AGENT_STATE["last_profile"] = cycle_profile
             except Exception as e:
+                _record_perf_log(
+                    "agent_cycle",
+                    {
+                        "status": "fail",
+                        "error": str(e),
+                    },
+                    PERF_ANALYSIS_ENABLED,
+                )
                 _set_agent_state(last_error=str(e), last_msg="本轮失败，将在等待后重试。")
 
             wait_sec = max(0.05, float(wait_ms) / 1000.0)
@@ -610,7 +745,7 @@ def _agent_worker(
 
 @app.post("/solve")
 def solve(req: SolveRequest):
-    return _solve_with_steps(req.board, req.blocks, source="api")
+    return _solve_with_steps(req.board, req.blocks, source="api", enable_profiling=PERF_ANALYSIS_ENABLED)
 
 @app.get("/api/set_bbox")
 def api_set_bbox():
@@ -629,9 +764,10 @@ def api_auto_recognize():
         return {"status": "fail", "msg": "请先点击「1. 框选预备区」设定识别范围！"}
     
     try:
+        started = time.perf_counter()
         blocks = extract_blocks_from_memory(CURRENT_BBOX)
         if len(blocks) != 4:
-            return {
+            result = {
                 "status": "fail",
                 "msg": (
                     f"识别数量异常：检测到 {len(blocks)} 个槽位，期望值为 4。"
@@ -639,9 +775,26 @@ def api_auto_recognize():
                     "已在项目根目录保存调试截图（cv_capture_1.png ~ cv_capture_3.png，自动轮转覆盖）。"
                 ),
             }
-        return {"status": "success", "blocks": blocks}
+            if PERF_ANALYSIS_ENABLED:
+                result["perf"] = {
+                    "enabled": True,
+                    "recognize_blocks_ms": _round_ms((time.perf_counter() - started) * 1000.0),
+                }
+                _record_perf_log("recognize_blocks", result, True)
+            return result
+
+        result = {"status": "success", "blocks": blocks}
+        if PERF_ANALYSIS_ENABLED:
+            result["perf"] = {
+                "enabled": True,
+                "recognize_blocks_ms": _round_ms((time.perf_counter() - started) * 1000.0),
+            }
+            _record_perf_log("recognize_blocks", result, True)
+        return result
     except Exception as e:
-        return {"status": "fail", "msg": f"视觉处理异常: {str(e)}"}
+        result = {"status": "fail", "msg": f"视觉处理异常: {str(e)}"}
+        _record_perf_log("recognize_blocks", result, PERF_ANALYSIS_ENABLED)
+        return result
 
 @app.get("/api/set_board_bbox")
 def api_set_board_bbox():
@@ -660,6 +813,8 @@ def api_get_settings():
         "status": "success",
         "settings": {
             "tmp_debug_enabled": bool(get_tmp_debug_enabled()),
+            "perf_analysis_enabled": bool(PERF_ANALYSIS_ENABLED),
+            "timing_profile": str(TIMING_PROFILE_CHOICE),
             "current_bbox": list(CURRENT_BBOX) if CURRENT_BBOX else None,
             "board_bbox": list(BOARD_BBOX) if BOARD_BBOX else None,
         },
@@ -667,15 +822,26 @@ def api_get_settings():
 
 
 @app.post("/api/settings")
+@app.put("/api/settings")
 def api_update_settings(req: SettingsUpdateRequest):
+    global PERF_ANALYSIS_ENABLED, TIMING_PROFILE_CHOICE
+    
     if req.tmp_debug_enabled is not None:
         set_tmp_debug_enabled(bool(req.tmp_debug_enabled))
+    if req.perf_analysis_enabled is not None:
+        PERF_ANALYSIS_ENABLED = bool(req.perf_analysis_enabled)
+    if req.timing_profile is not None:
+        choice = str(req.timing_profile).lower()
+        if choice in ("safe", "balanced", "fast"):
+            TIMING_PROFILE_CHOICE = choice
 
     _save_settings()
     return {
         "status": "success",
         "settings": {
             "tmp_debug_enabled": bool(get_tmp_debug_enabled()),
+            "perf_analysis_enabled": bool(PERF_ANALYSIS_ENABLED),
+            "timing_profile": str(TIMING_PROFILE_CHOICE),
             "current_bbox": list(CURRENT_BBOX) if CURRENT_BBOX else None,
             "board_bbox": list(BOARD_BBOX) if BOARD_BBOX else None,
         },
@@ -687,11 +853,21 @@ def api_recognize_board():
     if not BOARD_BBOX:
         return {"status": "fail", "msg": "请先点击「框选棋盘」设定识别范围！"}
     try:
+        started = time.perf_counter()
         board = extract_board_from_memory(BOARD_BBOX)
         filled = sum(board[r][c] for r in range(8) for c in range(8))
-        return {"status": "success", "board": board, "filled_count": filled}
+        result = {"status": "success", "board": board, "filled_count": filled}
+        if PERF_ANALYSIS_ENABLED:
+            result["perf"] = {
+                "enabled": True,
+                "recognize_board_ms": _round_ms((time.perf_counter() - started) * 1000.0),
+            }
+            _record_perf_log("recognize_board", result, True)
+        return result
     except Exception as e:
-        return {"status": "fail", "msg": f"棋盘识别异常: {str(e)}"}
+        result = {"status": "fail", "msg": f"棋盘识别异常: {str(e)}"}
+        _record_perf_log("recognize_board", result, PERF_ANALYSIS_ENABLED)
+        return result
 
 
 @app.post("/api/execute_solution")
@@ -713,6 +889,17 @@ def api_execute_solution(req: ExecuteRequest):
             backend=req.backend,
             dry_run=req.dry_run,
             timing_profile=req.timing_profile,
+            enable_profiling=PERF_ANALYSIS_ENABLED,
+        )
+        _record_perf_log(
+            "execute_solution",
+            {
+                "status": result.get("status"),
+                "backend": result.get("backend"),
+                "timing_profile": result.get("timing_profile"),
+                "perf": result.get("perf"),
+            },
+            PERF_ANALYSIS_ENABLED,
         )
         return result
     except Exception as e:
@@ -756,6 +943,7 @@ def api_agent_start(req: AgentStartRequest):
             "dry_run": bool(req.dry_run),
             "timing_profile": req.timing_profile,
             "stop_hotkey": hotkey_name,
+            "last_profile": None,
             "thread": None,
         })
 
