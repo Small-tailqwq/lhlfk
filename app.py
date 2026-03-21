@@ -34,6 +34,10 @@ STOP_HOTKEY_VK = {
     "F10": 0x79,
 }
 SETTINGS_FILE = Path(__file__).resolve().parent / "app_settings.json"
+DATA_DIR = Path(__file__).resolve().parent / "dataset"
+RECORD_FILE = DATA_DIR / "turn_history.jsonl"
+DATA_LOCK = threading.Lock()
+DATA_DIR.mkdir(exist_ok=True)
 
 @njit(fastmath=True, nogil=True, cache=True)
 def _check_fit(board, piece, r, c):
@@ -45,13 +49,37 @@ def _check_fit(board, piece, r, c):
         if board[nr * 8 + nc] == 1: return False
     return True
 
+
+@njit(fastmath=True, nogil=True, cache=True)
+def _is_anchored(board, piece, r, c):
+    for i in range(piece.shape[0]):
+        pr, pc = piece[i]
+        if pr == -1:
+            break
+
+        nr, nc = r + pr, c + pc
+        if nr == 0 or nr == 7 or nc == 0 or nc == 7:
+            return True
+
+        if nr > 0 and board[(nr - 1) * 8 + nc] == 1:
+            return True
+        if nr < 7 and board[(nr + 1) * 8 + nc] == 1:
+            return True
+        if nc > 0 and board[nr * 8 + nc - 1] == 1:
+            return True
+        if nc < 7 and board[nr * 8 + nc + 1] == 1:
+            return True
+
+    return False
+
 @njit(fastmath=True, nogil=True, cache=True)
 def _get_clear_score(lines):
     if lines == 0: return 0
     if lines == 1: return 200
     if lines == 2: return 500
     if lines == 3: return 1000
-    if lines >= 4: return 2000
+    if lines == 4: return 1500
+    if lines >= 5: return 1500
     return 0
 
 @njit(fastmath=True, nogil=True)
@@ -97,6 +125,7 @@ def _evaluate_board(board):
     holes = 0
     transitions = 0
     almost_full_lines = 0
+    empty_3x3_count = 0
 
     for r in range(8):
         row_sum = 0
@@ -131,19 +160,45 @@ def _evaluate_board(board):
         if col_sum == 6 or col_sum == 7:
             almost_full_lines += 1
 
+    for r in range(6):
+        for c in range(6):
+            is_3x3_empty = True
+            for i in range(3):
+                for j in range(3):
+                    if board[(r + i) * 8 + (c + j)] == 1:
+                        is_3x3_empty = False
+                        break
+                if not is_3x3_empty:
+                    break
+            if is_3x3_empty:
+                empty_3x3_count += 1
+
     score = 0.0
-    score -= holes * 20000.0
+    score -= holes * 800.0
     score -= transitions * 20.0
     score += almost_full_lines * 150.0
+    score -= empty_3x3_count * 1500.0
 
-    if empty_spaces < 22:
-        diff = 22 - empty_spaces
+    if empty_spaces >= 20:
+        score -= empty_spaces * 35.0
+
+    if empty_spaces < 20:
+        diff = 20 - empty_spaces
         score -= (diff * diff) * 200.0
 
     return score
 
 @njit(fastmath=True, nogil=True)
-def _solve_turn(board, pieces):
+def _count_empty_spaces(board):
+    empty_spaces = 0
+    for i in range(64):
+        if board[i] == 0:
+            empty_spaces += 1
+    return empty_spaces
+
+
+@njit(fastmath=True, nogil=True)
+def _solve_turn_core(board, pieces, use_anchor_prune):
     best_eval = -99999999.0
     best_moves = np.zeros((4, 3), dtype=np.int32)
     best_game_score = 0
@@ -154,40 +209,48 @@ def _solve_turn(board, pieces):
         for r1 in range(8):
             for c1 in range(8):
                 if not _check_fit(board, p1, r1, c1): continue
+                if use_anchor_prune and not _is_anchored(board, p1, r1, c1): continue
                 b1, score1 = _place_and_clear(board, p1, r1, c1)
                 
                 p2 = pieces[order[1]]
                 for r2 in range(8):
                     for c2 in range(8):
                         if not _check_fit(b1, p2, r2, c2): continue
+                        if use_anchor_prune and not _is_anchored(b1, p2, r2, c2): continue
                         b2, score2 = _place_and_clear(b1, p2, r2, c2)
                         
                         p3 = pieces[order[2]]
                         for r3 in range(8):
                             for c3 in range(8):
                                 if not _check_fit(b2, p3, r3, c3): continue
+                                if use_anchor_prune and not _is_anchored(b2, p3, r3, c3): continue
                                 b3, score3 = _place_and_clear(b2, p3, r3, c3)
                                 
                                 p4 = pieces[order[3]]
                                 for r4 in range(8):
                                     for c4 in range(8):
                                         if not _check_fit(b3, p4, r4, c4): continue
+                                        if use_anchor_prune and not _is_anchored(b3, p4, r4, c4): continue
                                         b4, score4 = _place_and_clear(b3, p4, r4, c4)
 
                                         base_eval = _evaluate_board(b4)
                                         total_game_score = score1 + score2 + score3 + score4
 
                                         single_clears = 0
+                                        double_clears = 0
+                                        big_burst_score = 0
                                         if score1 == 200: single_clears += 1
+                                        if score1 == 500: double_clears += 1
+                                        if score1 >= 1000: big_burst_score += score1
                                         if score2 == 200: single_clears += 1
+                                        if score2 == 500: double_clears += 1
+                                        if score2 >= 1000: big_burst_score += score2
                                         if score3 == 200: single_clears += 1
+                                        if score3 == 500: double_clears += 1
+                                        if score3 >= 1000: big_burst_score += score3
                                         if score4 == 200: single_clears += 1
-
-                                        multi_score = 0
-                                        if score1 > 200: multi_score += score1
-                                        if score2 > 200: multi_score += score2
-                                        if score3 > 200: multi_score += score3
-                                        if score4 > 200: multi_score += score4
+                                        if score4 == 500: double_clears += 1
+                                        if score4 >= 1000: big_burst_score += score4
 
                                         empty_spaces = 0
                                         for i in range(64):
@@ -195,14 +258,21 @@ def _solve_turn(board, pieces):
                                                 empty_spaces += 1
 
                                         tactical_score = 0.0
-                                        if empty_spaces < 22:
+                                        if empty_spaces < 20:
                                             tactical_score += total_game_score * 6.0
-                                            tactical_score += multi_score * 2.0
+                                            tactical_score += double_clears * 150.0
+                                            tactical_score += big_burst_score * 3.0
                                             tactical_score -= single_clears * 50.0
+                                        elif empty_spaces < 28:
+                                            tactical_score -= single_clears * 700.0
+                                            tactical_score += double_clears * 120.0
+                                            tactical_score += big_burst_score * 5.0
+                                            tactical_score += total_game_score * 0.6
                                         else:
-                                            tactical_score -= single_clears * 800.0
-                                            tactical_score += multi_score * 50.0
-                                            tactical_score += total_game_score * 0.2
+                                            tactical_score -= single_clears * 1200.0
+                                            tactical_score -= double_clears * 900.0
+                                            tactical_score += big_burst_score * 8.0
+                                            tactical_score += (40.0 - empty_spaces) * 35.0
 
                                         final_eval = base_eval + tactical_score
                                         
@@ -215,6 +285,18 @@ def _solve_turn(board, pieces):
                                             best_moves[3] = [order[3], r4, c4]
                                             
     return best_eval, best_game_score, best_moves
+
+
+@njit(fastmath=True, nogil=True)
+def _solve_turn(board, pieces):
+    # 空盘或近空盘时优先启用锚点剪枝；若剪枝后无解则回退全搜索，避免误杀最优解
+    empty_spaces = _count_empty_spaces(board)
+    if empty_spaces >= 40:
+        best_eval, best_game_score, best_moves = _solve_turn_core(board, pieces, True)
+        if best_eval != NO_SOLUTION_EVAL:
+            return best_eval, best_game_score, best_moves
+
+    return _solve_turn_core(board, pieces, False)
 
 # --- API 协议 ---
 class SolveRequest(BaseModel):
@@ -316,13 +398,38 @@ def _load_settings():
 _load_settings()
 
 
-def _solve_with_steps(board: List[List[int]], blocks: List[List[List[int]]]) -> Dict[str, Any]:
+def _record_turn_data(board_2d, blocks_3d, source: str, solve_result: Optional[Dict[str, Any]] = None):
+    record = {
+        "timestamp": time.time(),
+        "source": source,
+        "board": board_2d,
+        "pieces": blocks_3d,
+    }
+    if solve_result is not None:
+        record["solve_status"] = solve_result.get("status")
+        record["evaluation"] = solve_result.get("evaluation")
+        record["game_score_gained"] = solve_result.get("game_score_gained")
+        record["steps"] = solve_result.get("steps")
+    try:
+        with DATA_LOCK:
+            with RECORD_FILE.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception:
+        # 记录失败不影响主流程，避免线上执行中断
+        pass
+
+
+def _solve_with_steps(board: List[List[int]], blocks: List[List[List[int]]], source: str = "unknown") -> Dict[str, Any]:
     if len(blocks) != 4:
-        return {"status": "fail", "msg": "参数校验失败：必须提供 4 个方块"}
+        result = {"status": "fail", "msg": "参数校验失败：必须提供 4 个方块"}
+        _record_turn_data(board, blocks, source, result)
+        return result
 
     board_1d = np.array(board, dtype=np.int8).flatten()
     if board_1d.size != 64:
-        return {"status": "fail", "msg": "参数校验失败：棋盘尺寸必须为 8x8"}
+        result = {"status": "fail", "msg": "参数校验失败：棋盘尺寸必须为 8x8"}
+        _record_turn_data(board, blocks, source, result)
+        return result
 
     pieces_arr = np.full((4, 16, 2), -1, dtype=np.int8)
     for i, block_coords in enumerate(blocks):
@@ -333,7 +440,9 @@ def _solve_with_steps(board: List[List[int]], blocks: List[List[List[int]]]) -> 
 
     eval_score, game_score, moves = _solve_turn(board_1d, pieces_arr)
     if eval_score == NO_SOLUTION_EVAL:
-        return {"status": "fail", "msg": "Game Over：当前盘面下这4个方块无法全部放置。"}
+        result = {"status": "fail", "msg": "Game Over：当前盘面下这4个方块无法全部放置。"}
+        _record_turn_data(board, blocks, source, result)
+        return result
 
     steps = []
     current_sim_board = board_1d.copy()
@@ -356,12 +465,14 @@ def _solve_with_steps(board: List[List[int]], blocks: List[List[List[int]]]) -> 
         })
         current_sim_board = next_board
 
-    return {
+    result = {
         "status": "success",
         "game_score_gained": int(game_score),
         "evaluation": float(eval_score),
         "steps": steps,
     }
+    _record_turn_data(board, blocks, source, result)
+    return result
 
 
 def _resolve_stop_hotkey(hotkey_name: str):
@@ -450,7 +561,7 @@ def _agent_worker(
 
                 board = extract_board_from_memory(BOARD_BBOX)
                 blocks = extract_blocks_from_memory(CURRENT_BBOX)
-                solve_result = _solve_with_steps(board, blocks)
+                solve_result = _solve_with_steps(board, blocks, source="agent")
                 if solve_result.get("status") != "success":
                     raise RuntimeError(solve_result.get("msg", "推导失败"))
 
@@ -499,7 +610,7 @@ def _agent_worker(
 
 @app.post("/solve")
 def solve(req: SolveRequest):
-    return _solve_with_steps(req.board, req.blocks)
+    return _solve_with_steps(req.board, req.blocks, source="api")
 
 @app.get("/api/set_bbox")
 def api_set_bbox():

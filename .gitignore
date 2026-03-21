@@ -17,3 +17,4 @@ __pycache__/
 *.pyc
 .vscode/
 .venv/
+dataset/
