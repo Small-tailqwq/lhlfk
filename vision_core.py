@@ -7,6 +7,19 @@ from datetime import datetime
 from pathlib import Path
 from PIL import ImageGrab
 
+TMP_DEBUG_ENABLED = False
+
+
+def set_tmp_debug_enabled(enabled):
+    """设置是否输出 tmp 目录的中间调试图。"""
+    global TMP_DEBUG_ENABLED
+    TMP_DEBUG_ENABLED = bool(enabled)
+
+
+def get_tmp_debug_enabled():
+    """读取 tmp 调试图开关状态。"""
+    return bool(TMP_DEBUG_ENABLED)
+
 # --- Windows DPI 适配，防止高分屏下坐标偏移 ---
 try:
     ctypes.windll.user32.SetProcessDPIAware()
@@ -182,6 +195,9 @@ def _to_debug_image(img):
 
 def _save_tmp_step(run_id, step_name, img):
     """将识别流程中的中间图像保存到项目 tmp 目录。"""
+    if not TMP_DEBUG_ENABLED:
+        return None
+
     debug_img = _to_debug_image(img)
     if debug_img is None:
         return None

@@ -73,6 +73,19 @@
         </div>
     </div>
 
+    <div style="background: #1f2432; padding: 10px; border-radius: 6px; margin-bottom: 15px; border: 1px solid #5f6b85;">
+        <h3 style="margin: 0 0 10px 0; font-size: 1rem; color: #9ad9ff;">⚙ 设置</h3>
+        <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:13px;">
+            <input type="checkbox" id="chkTmpDebug" onchange="onToggleTmpDebug()" />
+            输出识别过程图像到 tmp 目录（调试模式）
+        </label>
+        <div style="font-size: 12px; color: #c7d2e8; line-height: 1.5; margin-bottom: 8px;">
+            <div>预备区坐标: <span id="savedCaptureBbox">未保存</span></div>
+            <div>棋盘区坐标: <span id="savedBoardBbox">未保存</span></div>
+        </div>
+        <button onclick="loadSettings(true)" style="background: #44516e; width: 100%;">刷新设置状态</button>
+    </div>
+
     <h2>2. 方块建模绘制 (5x5)</h2>
     <div class="drawer" id="drawerGrid"></div>
     <div class="btn-group">
@@ -278,6 +291,7 @@
             const data = await res.json();
             if(data.status === 'success') {
                 logEl.innerHTML += `✅ ${data.msg}\n`;
+                await loadSettings(false);
             } else {
                 logEl.innerHTML += `❌ ${data.msg}\n`;
             }
@@ -293,8 +307,67 @@
             const res = await fetch('http://127.0.0.1:8000/api/set_board_bbox');
             const data = await res.json();
             logEl.innerHTML += (data.status === 'success' ? `✅ ${data.msg}\n` : `❌ ${data.msg}\n`);
+            if(data.status === 'success') {
+                await loadSettings(false);
+            }
         } catch(e) {
             logEl.innerHTML += `🚨 网络错误: ${e.message}\n`;
+        }
+    }
+
+    function formatBboxText(bbox) {
+        if(!bbox || !Array.isArray(bbox) || bbox.length !== 4) return '未保存';
+        return `(${bbox[0]}, ${bbox[1]}, ${bbox[2]}, ${bbox[3]})`;
+    }
+
+    function renderSettings(settings) {
+        document.getElementById('chkTmpDebug').checked = !!settings.tmp_debug_enabled;
+        document.getElementById('savedCaptureBbox').innerText = formatBboxText(settings.current_bbox);
+        document.getElementById('savedBoardBbox').innerText = formatBboxText(settings.board_bbox);
+    }
+
+    async function loadSettings(showLog = false) {
+        const logEl = document.getElementById('log');
+        try {
+            const res = await fetch('http://127.0.0.1:8000/api/settings');
+            const data = await res.json();
+            if(data.status === 'success' && data.settings) {
+                renderSettings(data.settings);
+                if(showLog) {
+                    logEl.innerHTML += '[系统] 设置已刷新。\n';
+                }
+            } else if(showLog) {
+                logEl.innerHTML += `❌ 设置读取失败: ${data.msg || '未知错误'}\n`;
+            }
+        } catch(e) {
+            if(showLog) {
+                logEl.innerHTML += `🚨 设置读取网络错误: ${e.message}\n`;
+            }
+        }
+    }
+
+    async function onToggleTmpDebug() {
+        const logEl = document.getElementById('log');
+        const enabled = document.getElementById('chkTmpDebug').checked;
+        try {
+            const res = await fetch('http://127.0.0.1:8000/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ tmp_debug_enabled: enabled })
+            });
+            const data = await res.json();
+            if(data.status === 'success' && data.settings) {
+                renderSettings(data.settings);
+                logEl.innerHTML += enabled
+                    ? '[系统] 已开启调试模式：后续识别会输出 tmp 过程图。\n'
+                    : '[系统] 已关闭调试模式：停止输出 tmp 过程图。\n';
+            } else {
+                logEl.innerHTML += `❌ 设置保存失败: ${data.msg || '未知错误'}\n`;
+                await loadSettings(false);
+            }
+        } catch(e) {
+            logEl.innerHTML += `🚨 设置保存网络错误: ${e.message}\n`;
+            await loadSettings(false);
         }
     }
 
@@ -603,6 +676,7 @@
     renderBoard();
     renderDrawer();
     renderQueue();
+    loadSettings(false);
     refreshAgentStatus();
 </script>
 </body>

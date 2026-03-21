@@ -9,8 +9,17 @@ import itertools
 import threading
 import time
 import ctypes
+import json
+from pathlib import Path
+from typing import Optional
 import uvicorn
-from vision_core import get_screen_bbox, extract_blocks_from_memory, extract_board_from_memory
+from vision_core import (
+    get_screen_bbox,
+    extract_blocks_from_memory,
+    extract_board_from_memory,
+    set_tmp_debug_enabled,
+    get_tmp_debug_enabled,
+)
 from executor import execute_solution_steps, is_running_as_admin
 
 app = FastAPI()
@@ -24,6 +33,7 @@ STOP_HOTKEY_VK = {
     "F9": 0x78,
     "F10": 0x79,
 }
+SETTINGS_FILE = Path(__file__).resolve().parent / "app_settings.json"
 
 @njit(fastmath=True, nogil=True, cache=True)
 def _check_fit(board, piece, r, c):
@@ -236,6 +246,10 @@ class AgentStartRequest(BaseModel):
     stop_hotkey: str = "F8"
 
 
+class SettingsUpdateRequest(BaseModel):
+    tmp_debug_enabled: Optional[bool] = None
+
+
 AGENT_LOCK = threading.Lock()
 AGENT_STATE: Dict[str, Any] = {
     "running": False,
@@ -252,6 +266,54 @@ AGENT_STATE: Dict[str, Any] = {
     "stop_hotkey": "F8",
     "thread": None,
 }
+
+# 全局存储框选坐标（支持持久化）
+CURRENT_BBOX = None
+BOARD_BBOX = None
+
+
+def _normalize_bbox(value):
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return None
+
+    try:
+        x1, y1, x2, y2 = [int(v) for v in value]
+    except Exception:
+        return None
+
+    if x2 - x1 <= 10 or y2 - y1 <= 10:
+        return None
+    return (x1, y1, x2, y2)
+
+
+def _save_settings():
+    payload = {
+        "tmp_debug_enabled": bool(get_tmp_debug_enabled()),
+        "current_bbox": list(CURRENT_BBOX) if CURRENT_BBOX else None,
+        "board_bbox": list(BOARD_BBOX) if BOARD_BBOX else None,
+    }
+    SETTINGS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _load_settings():
+    global CURRENT_BBOX, BOARD_BBOX
+
+    if not SETTINGS_FILE.exists():
+        set_tmp_debug_enabled(False)
+        return
+
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        set_tmp_debug_enabled(False)
+        return
+
+    set_tmp_debug_enabled(bool(data.get("tmp_debug_enabled", False)))
+    CURRENT_BBOX = _normalize_bbox(data.get("current_bbox"))
+    BOARD_BBOX = _normalize_bbox(data.get("board_bbox"))
+
+
+_load_settings()
 
 
 def _solve_with_steps(board: List[List[int]], blocks: List[List[List[int]]]) -> Dict[str, Any]:
@@ -438,11 +500,6 @@ def _agent_worker(
 @app.post("/solve")
 def solve(req: SolveRequest):
     return _solve_with_steps(req.board, req.blocks)
-    
-
-# 全局存储框选坐标
-CURRENT_BBOX = None
-BOARD_BBOX = None
 
 @app.get("/api/set_bbox")
 def api_set_bbox():
@@ -450,6 +507,7 @@ def api_set_bbox():
     bbox = get_screen_bbox()
     if bbox and (bbox[2] - bbox[0] > 10 and bbox[3] - bbox[1] > 10):
         CURRENT_BBOX = bbox
+        _save_settings()
         return {"status": "success", "bbox": bbox, "msg": f"区域已锁定: {bbox}"}
     return {"status": "fail", "msg": "框选无效或被取消"}
 
@@ -480,8 +538,37 @@ def api_set_board_bbox():
     bbox = get_screen_bbox()
     if bbox and (bbox[2] - bbox[0] > 10 and bbox[3] - bbox[1] > 10):
         BOARD_BBOX = bbox
+        _save_settings()
         return {"status": "success", "bbox": bbox, "msg": f"棋盘区域已锁定: {bbox}"}
     return {"status": "fail", "msg": "框选无效或被取消"}
+
+
+@app.get("/api/settings")
+def api_get_settings():
+    return {
+        "status": "success",
+        "settings": {
+            "tmp_debug_enabled": bool(get_tmp_debug_enabled()),
+            "current_bbox": list(CURRENT_BBOX) if CURRENT_BBOX else None,
+            "board_bbox": list(BOARD_BBOX) if BOARD_BBOX else None,
+        },
+    }
+
+
+@app.post("/api/settings")
+def api_update_settings(req: SettingsUpdateRequest):
+    if req.tmp_debug_enabled is not None:
+        set_tmp_debug_enabled(bool(req.tmp_debug_enabled))
+
+    _save_settings()
+    return {
+        "status": "success",
+        "settings": {
+            "tmp_debug_enabled": bool(get_tmp_debug_enabled()),
+            "current_bbox": list(CURRENT_BBOX) if CURRENT_BBOX else None,
+            "board_bbox": list(BOARD_BBOX) if BOARD_BBOX else None,
+        },
+    }
 
 @app.get("/api/recognize_board")
 def api_recognize_board():
