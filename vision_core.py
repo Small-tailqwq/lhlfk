@@ -438,12 +438,74 @@ def _recover_vertical_by_projection(mask, squares, coords, base_side, debug_run_
     return repaired
 
 
-def _detect_blocks_in_crop(crop_img, debug_run_id, slot_idx, tail_img=None, return_details=False):
-    """对单个候选区裁图进行方块识别。
+def _recover_square_from_low_fill_strips(mask, raw_blobs, rejected_blobs, base_side):
+    """从低填充横条轮廓中恢复被横线粘连的单个方格（典型为竖排 5x1 的顶/底格）。"""
+    if not raw_blobs or not rejected_blobs:
+        return []
 
-    默认返回归一化坐标 [[row, col], ...]；
-    当 return_details=True 时，返回 {"coords": ..., "cell_points": ...}。
-    """
+    # 仅在当前已呈现“单列竖排”特征时启用，降低误检风险。
+    raw_cx = np.array([b['x'] + b['w'] * 0.5 for b in raw_blobs], dtype=np.float32)
+    if len(raw_cx) < 3:
+        return []
+    if float(np.std(raw_cx)) > max(4.0, base_side * 0.2):
+        return []
+
+    img_h, img_w = mask.shape[:2]
+    target_cx = float(np.median(raw_cx))
+    recovered = []
+
+    for blob in rejected_blobs:
+        x, y, w, h = blob['x'], blob['y'], blob['w'], blob['h']
+        fill_ratio = blob['fill_ratio']
+
+        if w < int(img_w * 0.82):
+            continue
+        if h < int(base_side * 0.55) or h > int(base_side * 1.45):
+            continue
+        if fill_ratio > 0.4:
+            continue
+
+        roi = mask[y:y + h, x:x + w]
+        if roi.size == 0:
+            continue
+
+        x_proj = (roi > 0).sum(axis=0)
+        x_th = max(6, int(round(h * 0.55)))
+        runs = _proj_runs(x_proj > x_th)
+        runs = _merge_runs(runs, max_gap=2)
+        if not runs:
+            continue
+
+        best = None
+        best_score = None
+        for s, e in runs:
+            rw = e - s
+            if rw < int(base_side * 0.5) or rw > int(base_side * 1.6):
+                continue
+            rcx = x + 0.5 * (s + e)
+            score = abs(rcx - target_cx)
+            if best is None or score < best_score:
+                best = (s, e)
+                best_score = score
+
+        if best is None:
+            continue
+
+        s, e = best
+        rec_x = int(round(x + s))
+        rec_w = int(round(e - s))
+        recovered.append({
+            "x": rec_x,
+            "y": y,
+            "w": rec_w,
+            "h": h,
+        })
+
+    return recovered
+
+
+def _detect_blocks_in_crop(crop_img, debug_run_id, slot_idx, tail_img=None):
+    """对单个候选区裁图进行方块识别，返回归一化坐标 [[row, col], ...]"""
     img_h, img_w = crop_img.shape[:2]
 
     hsv = cv2.cvtColor(crop_img, cv2.COLOR_BGR2HSV)
@@ -468,27 +530,31 @@ def _detect_blocks_in_crop(crop_img, debug_run_id, slot_idx, tail_img=None, retu
     max_side = int(max(img_h, img_w) * 0.95)
 
     raw_blobs = []
+    rejected_blobs = []
     for cnt in contours:
         x, y, w, h = cv2.boundingRect(cnt)
         area = cv2.contourArea(cnt)
         short_side = min(w, h)
         fill_ratio = area / float(max(w * h, 1))
 
-        if short_side < min_side:
-            continue
-        if area < (min_side * min_side * 0.35):
+        if short_side < min_side or area < (min_side * min_side * 0.35) or area > (img_h * img_w * 0.85):
+            rejected_blobs.append({"x": x, "y": y, "w": w, "h": h, "fill_ratio": fill_ratio, "area": area})
             continue
         if fill_ratio < 0.55:
-            continue
-        if area > (img_h * img_w * 0.85):
+            rejected_blobs.append({"x": x, "y": y, "w": w, "h": h, "fill_ratio": fill_ratio, "area": area})
             continue
 
         raw_blobs.append({"x": x, "y": y, "w": w, "h": h})
 
-    _save_tmp_step(debug_run_id, f"04_slot{slot_idx}_raw_blobs", _draw_blob_debug(crop_img, raw_blobs))
-
     if not raw_blobs:
         return []
+
+    base_side = float(np.median([min(b['w'], b['h']) for b in raw_blobs]))
+    recovered_blobs = _recover_square_from_low_fill_strips(mask, raw_blobs, rejected_blobs, base_side)
+    if recovered_blobs:
+        raw_blobs.extend(recovered_blobs)
+
+    _save_tmp_step(debug_run_id, f"04_slot{slot_idx}_raw_blobs", _draw_blob_debug(crop_img, raw_blobs))
 
     base_side = float(np.median([min(b['w'], b['h']) for b in raw_blobs]))
     merge_ratio = 1.45
@@ -583,33 +649,14 @@ def _detect_blocks_in_crop(crop_img, debug_run_id, slot_idx, tail_img=None, retu
     step_y = max(float(np.median(y_diffs)) if y_diffs else grid_step, grid_step * 0.75)
 
     coord_set = set()
-    cell_point_map = {}
     for sq in squares:
         col = int(round((sq['cx'] - min_x) / step_x))
         row = int(round((sq['cy'] - min_y) / step_y))
         coord_set.add((row, col))
-        cell_point_map.setdefault((row, col), []).append((sq['cx'], sq['cy']))
 
     coords = [[r, c] for (r, c) in sorted(coord_set, key=lambda t: (t[0], t[1]))]
     coords = _recover_vertical_by_projection(mask, squares, coords, base_side, debug_run_id, slot_idx)
-    coords = _recover_vertical_tail_cell(crop_img, tail_img, squares, coords, base_side, debug_run_id, slot_idx)
-
-    if not return_details:
-        return coords
-
-    # 记录每个归一化格子的局部像素中心；补偿新增格子用步长估算中心。
-    cell_points = []
-    for row, col in coords:
-        samples = cell_point_map.get((row, col), [])
-        if samples:
-            avg_x = int(round(float(np.mean([p[0] for p in samples]))))
-            avg_y = int(round(float(np.mean([p[1] for p in samples]))))
-        else:
-            avg_x = int(round(min_x + col * step_x))
-            avg_y = int(round(min_y + row * step_y))
-        cell_points.append({"row": int(row), "col": int(col), "cx": avg_x, "cy": avg_y})
-
-    return {"coords": coords, "cell_points": cell_points}
+    return _recover_vertical_tail_cell(crop_img, tail_img, squares, coords, base_side, debug_run_id, slot_idx)
 
 
 def extract_blocks_from_memory(bbox):
@@ -662,56 +709,53 @@ def extract_blocks_from_memory(bbox):
 
 
 def extract_blocks_with_screen_points(bbox):
-    """识别 4 个槽位并返回每个格子的屏幕坐标，用于拖放执行器。"""
-    pil_img = ImageGrab.grab(bbox=bbox)
-    img_np = np.array(pil_img)
-    img_cv2 = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-    debug_run_id = _new_debug_run_id("exec")
+    """兼容执行器接口：返回每个槽位的方块坐标与屏幕点位。"""
+    blocks = extract_blocks_from_memory(bbox)
 
-    img_h, img_w = img_cv2.shape[:2]
-    slot_h = img_w
-    gap_h = (img_h - slot_h * 4) / 3.0
-    extra_h = int(slot_h * 0.35)
+    x1, y1, x2, y2 = [int(v) for v in bbox]
+    cap_w = max(1, x2 - x1)
+    cap_h = max(1, y2 - y1)
+    slot_h = cap_w
+    gap_h = (cap_h - slot_h * 4) / 3.0 if cap_h > slot_h * 4 else 0.0
 
-    abs_x1 = int(bbox[0])
-    abs_y1 = int(bbox[1])
-
+    # UI 中单格最大可达 5 格，使用 slot 宽度/5 估算中心步长。
+    cell_step = cap_w / 5.0
     slot_details = []
+
     for i in range(4):
-        y1 = int(round(i * (slot_h + gap_h)))
-        y2_base = int(round(y1 + slot_h))
-        y2_tail = min(y2_base + extra_h, img_h)
+        sy1 = int(round(y1 + i * (slot_h + gap_h)))
+        sy2 = int(round(sy1 + slot_h))
+        slot_bbox = [x1, sy1, x2, sy2]
 
-        crop = img_cv2[y1:y2_base, 0:img_w]
-        tail = img_cv2[y2_base:y2_tail, 0:img_w]
-        detail = _detect_blocks_in_crop(
-            crop,
-            debug_run_id,
-            i,
-            tail_img=tail,
-            return_details=True,
-        )
+        coords = blocks[i] if i < len(blocks) else []
+        coords = [[int(r), int(c)] for r, c in coords]
 
-        coords = detail["coords"]
         cell_points = []
-        for p in detail["cell_points"]:
-            cell_points.append({
-                "row": int(p["row"]),
-                "col": int(p["col"]),
-                "x": int(abs_x1 + p["cx"]),
-                "y": int(abs_y1 + y1 + p["cy"]),
-            })
+        if coords:
+            rows = [rc[0] for rc in coords]
+            cols = [rc[1] for rc in coords]
+            piece_h = max(rows) + 1
+            piece_w = max(cols) + 1
+
+            center_x = x1 + cap_w / 2.0
+            center_y = sy1 + slot_h / 2.0
+            origin_x = center_x - ((piece_w - 1) * cell_step) / 2.0
+            origin_y = center_y - ((piece_h - 1) * cell_step) / 2.0
+
+            for r, c in sorted(coords, key=lambda t: (t[0], t[1])):
+                px = int(round(origin_x + c * cell_step))
+                py = int(round(origin_y + r * cell_step))
+
+                # 限制到 slot 范围内，避免极端情况下越界。
+                px = max(x1, min(px, x2 - 1))
+                py = max(sy1, min(py, sy2 - 1))
+                cell_points.append({"row": int(r), "col": int(c), "x": px, "y": py})
 
         slot_details.append({
             "slot_index": i,
+            "slot_bbox": slot_bbox,
             "coords": coords,
             "cell_points": cell_points,
-            "slot_bbox": [
-                int(abs_x1),
-                int(abs_y1 + y1),
-                int(abs_x1 + img_w),
-                int(abs_y1 + y2_base),
-            ],
         })
 
     return slot_details

@@ -40,8 +40,8 @@ def _get_clear_score(lines):
     if lines == 0: return 0
     if lines == 1: return 200
     if lines == 2: return 500
-    if lines == 3: return 900
-    if lines >= 4: return lines * 400
+    if lines == 3: return 1000
+    if lines >= 4: return 2000
     return 0
 
 @njit(fastmath=True, nogil=True)
@@ -85,17 +85,52 @@ def _place_and_clear(board, piece, r, c):
 def _evaluate_board(board):
     empty_spaces = 0
     holes = 0
+    transitions = 0
+    almost_full_lines = 0
+
     for r in range(8):
+        row_sum = 0
         for c in range(8):
-            if board[r * 8 + c] == 0:
+            idx = r * 8 + c
+            cell = board[idx]
+
+            if cell == 0:
                 empty_spaces += 1
                 is_hole = True
-                if r > 0 and board[(r - 1) * 8 + c] == 0: is_hole = False
-                elif r < 7 and board[(r + 1) * 8 + c] == 0: is_hole = False
-                elif c > 0 and board[r * 8 + c - 1] == 0: is_hole = False
-                elif c < 7 and board[r * 8 + c + 1] == 0: is_hole = False
-                if is_hole: holes += 1
-    return (empty_spaces * 10) - (holes * 500)
+                if r > 0 and board[idx - 8] == 0: is_hole = False
+                elif r < 7 and board[idx + 8] == 0: is_hole = False
+                elif c > 0 and board[idx - 1] == 0: is_hole = False
+                elif c < 7 and board[idx + 1] == 0: is_hole = False
+                if is_hole:
+                    holes += 1
+            else:
+                row_sum += 1
+
+            if c < 7 and cell != board[idx + 1]:
+                transitions += 1
+            if r < 7 and cell != board[idx + 8]:
+                transitions += 1
+
+        if row_sum == 6 or row_sum == 7:
+            almost_full_lines += 1
+
+    for c in range(8):
+        col_sum = 0
+        for r in range(8):
+            col_sum += board[r * 8 + c]
+        if col_sum == 6 or col_sum == 7:
+            almost_full_lines += 1
+
+    score = 0.0
+    score -= holes * 20000.0
+    score -= transitions * 20.0
+    score += almost_full_lines * 150.0
+
+    if empty_spaces < 22:
+        diff = 22 - empty_spaces
+        score -= (diff * diff) * 200.0
+
+    return score
 
 @njit(fastmath=True, nogil=True)
 def _solve_turn(board, pieces):
@@ -128,9 +163,38 @@ def _solve_turn(board, pieces):
                                     for c4 in range(8):
                                         if not _check_fit(b3, p4, r4, c4): continue
                                         b4, score4 = _place_and_clear(b3, p4, r4, c4)
-                                        
+
+                                        base_eval = _evaluate_board(b4)
                                         total_game_score = score1 + score2 + score3 + score4
-                                        final_eval = _evaluate_board(b4) + (total_game_score * 10000)
+
+                                        single_clears = 0
+                                        if score1 == 200: single_clears += 1
+                                        if score2 == 200: single_clears += 1
+                                        if score3 == 200: single_clears += 1
+                                        if score4 == 200: single_clears += 1
+
+                                        multi_score = 0
+                                        if score1 > 200: multi_score += score1
+                                        if score2 > 200: multi_score += score2
+                                        if score3 > 200: multi_score += score3
+                                        if score4 > 200: multi_score += score4
+
+                                        empty_spaces = 0
+                                        for i in range(64):
+                                            if b4[i] == 0:
+                                                empty_spaces += 1
+
+                                        tactical_score = 0.0
+                                        if empty_spaces < 22:
+                                            tactical_score += total_game_score * 6.0
+                                            tactical_score += multi_score * 2.0
+                                            tactical_score -= single_clears * 50.0
+                                        else:
+                                            tactical_score -= single_clears * 800.0
+                                            tactical_score += multi_score * 50.0
+                                            tactical_score += total_game_score * 0.2
+
+                                        final_eval = base_eval + tactical_score
                                         
                                         if final_eval > best_eval:
                                             best_eval = final_eval

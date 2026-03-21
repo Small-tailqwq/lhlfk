@@ -14,6 +14,7 @@ TIMING_PROFILES: Dict[str, Dict[str, float]] = {
         "hold_after_arrive_sec": 0.06,
         "release_settle_sec": 0.12,
         "inter_step_sec": 0.28,
+        "clear_extra_sec": 1.0,
         "min_steps": 9.0,
         "px_per_step": 45.0,
     },
@@ -24,6 +25,7 @@ TIMING_PROFILES: Dict[str, Dict[str, float]] = {
         "hold_after_arrive_sec": 0.04,
         "release_settle_sec": 0.08,
         "inter_step_sec": 0.16,
+        "clear_extra_sec": 1.0,
         "min_steps": 7.0,
         "px_per_step": 60.0,
     },
@@ -34,6 +36,7 @@ TIMING_PROFILES: Dict[str, Dict[str, float]] = {
         "hold_after_arrive_sec": 0.015,
         "release_settle_sec": 0.05,
         "inter_step_sec": 0.05,
+        "clear_extra_sec": 1.0,
         "min_steps": 4.0,
         "px_per_step": 110.0,
     },
@@ -74,28 +77,100 @@ def choose_piece_anchor(coords: Sequence[Sequence[int]]) -> Tuple[int, int]:
     col_max = max(c for _, c in norm)
     h = row_max + 1
     w = col_max + 1
+    norm_set = set(norm)
 
     # 规则优先：匹配用户观察到的人类拖拽焦点。
     if h % 2 == 1 and w % 2 == 1:
         candidate = (h // 2, w // 2)
     elif h % 2 == 0 and w % 2 == 1:
-        candidate = (h // 2 - 1, w // 2)
-    elif h % 2 == 1 and w % 2 == 0:
-        candidate = (h // 2, w // 2 - 1)
-    else:
-        # 偶数 x 偶数：取中心四格中的左上（2x2 时即 [0,0]）。
-        candidate = (h // 2 - 1, w // 2 - 1)
+        center_col = w // 2
+        top_row = h // 2 - 1
+        bottom_row = h // 2
+        top_cell = (top_row, center_col)
+        bottom_cell = (bottom_row, center_col)
 
-    norm_set = set(norm)
+        if top_cell in norm_set and bottom_cell not in norm_set:
+            candidate = top_cell
+        elif bottom_cell in norm_set and top_cell not in norm_set:
+            candidate = bottom_cell
+        elif top_cell in norm_set and bottom_cell in norm_set:
+            row_mean = float(sum(r for r, _ in norm)) / float(len(norm))
+            if row_mean > (top_row + bottom_row) / 2.0:
+                candidate = bottom_cell
+            elif row_mean < (top_row + bottom_row) / 2.0:
+                candidate = top_cell
+            else:
+                # 重心居中时，保持传统矩形块习惯：选上侧。
+                candidate = top_cell
+        else:
+            candidate = top_cell
+    elif h % 2 == 1 and w % 2 == 0:
+        center_row = h // 2
+        left_col = w // 2 - 1
+        right_col = w // 2
+        left_cell = (center_row, left_col)
+        right_cell = (center_row, right_col)
+
+        if left_cell in norm_set and right_cell not in norm_set:
+            candidate = left_cell
+        elif right_cell in norm_set and left_cell not in norm_set:
+            candidate = right_cell
+        elif left_cell in norm_set and right_cell in norm_set:
+            # 两侧都可选时，偏向“更靠近重心”的一侧。
+            col_mean = float(sum(c for _, c in norm)) / float(len(norm))
+            if col_mean > (left_col + right_col) / 2.0:
+                candidate = right_cell
+            elif col_mean < (left_col + right_col) / 2.0:
+                candidate = left_cell
+            else:
+                # 重心居中时，选左侧以保持矩形块的稳定习惯。
+                candidate = left_cell
+        else:
+            candidate = left_cell
+    else:
+        top_row = h // 2 - 1
+        bottom_row = h // 2
+        left_col = w // 2 - 1
+        right_col = w // 2
+        center_cells = [
+            (top_row, left_col),
+            (top_row, right_col),
+            (bottom_row, left_col),
+            (bottom_row, right_col),
+        ]
+        present_centers = [rc for rc in center_cells if rc in norm_set]
+
+        if len(present_centers) == 4:
+            # 规则保留：完整 2x2（或完整中心四格）锚点取左上。
+            candidate = (top_row, left_col)
+        elif present_centers:
+            # 非完整中心块时，按重心选择最近中心格；并在并列时偏向右下。
+            row_mean = float(sum(r for r, _ in norm)) / float(len(norm))
+            col_mean = float(sum(c for _, c in norm)) / float(len(norm))
+            candidate = min(
+                present_centers,
+                key=lambda rc: (
+                    (rc[0] - row_mean) ** 2 + (rc[1] - col_mean) ** 2,
+                    -rc[0],
+                    -rc[1],
+                ),
+            )
+        else:
+            candidate = (top_row, left_col)
+
     if candidate in norm_set:
         return candidate
 
-    # 奇数 x 奇数但中心缺失时，优先取中心列中最靠上的真实方块。
+    # 奇数 x 奇数但中心缺失时，优先取“贴近中心”的相邻格。
     if h % 2 == 1 and w % 2 == 1:
+        center_row = h // 2
         center_col = w // 2
-        col_hits = [rc for rc in norm if rc[1] == center_col]
-        if col_hits:
-            return min(col_hits, key=lambda rc: (rc[0], rc[1]))
+        adjacent_hits = [
+            rc for rc in norm
+            if abs(rc[0] - center_row) + abs(rc[1] - center_col) == 1
+        ]
+        if adjacent_hits:
+            return min(adjacent_hits, key=lambda rc: (rc[0], rc[1]))
 
     # 回退：取离几何中心最近的真实格子。
     center_r = (h - 1) / 2.0
@@ -280,6 +355,10 @@ def execute_solution_steps(
         if not dry_run and input_backend is not None:
             _drag_mouse(input_backend, src, dst, timing)
             time.sleep(float(timing["inter_step_sec"]))
+            score_gained = int(step.get("score_gained", 0) or 0)
+            if score_gained > 0:
+                # 触发消除后棋盘会短暂锁定，额外等待以避免下一步被吞。
+                time.sleep(float(timing["clear_extra_sec"]))
 
         actions.append(
             {
@@ -289,6 +368,7 @@ def execute_solution_steps(
                 "source": [int(src[0]), int(src[1])],
                 "target": [int(dst[0]), int(dst[1])],
                 "target_cell": [target_row, target_col],
+                "score_gained": int(step.get("score_gained", 0) or 0),
             }
         )
 
