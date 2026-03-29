@@ -26,6 +26,8 @@ app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 # --- 核心算法 (Numba JIT 保持极致性能) ---
+PERMS_2 = np.array(list(itertools.permutations([0, 1])), dtype=np.int8)
+PERMS_3 = np.array(list(itertools.permutations([0, 1, 2])), dtype=np.int8)
 PERMS_4 = np.array(list(itertools.permutations([0, 1, 2, 3])), dtype=np.int8)
 NO_SOLUTION_EVAL = -99999999.0
 STOP_HOTKEY_VK = {
@@ -199,84 +201,194 @@ def _count_empty_spaces(board):
 
 
 @njit(fastmath=True, nogil=True)
-def _solve_turn_core(board, pieces, use_anchor_prune):
-    best_eval = -99999999.0
-    best_moves = np.zeros((4, 3), dtype=np.int32)
+def _compose_final_eval(board_after, score1, score2, score3, score4):
+    base_eval = _evaluate_board(board_after)
+    total_game_score = score1 + score2 + score3 + score4
+
+    single_clears = 0
+    double_clears = 0
+    big_burst_score = 0
+
+    if score1 == 200:
+        single_clears += 1
+    if score1 == 500:
+        double_clears += 1
+    if score1 >= 1000:
+        big_burst_score += score1
+
+    if score2 == 200:
+        single_clears += 1
+    if score2 == 500:
+        double_clears += 1
+    if score2 >= 1000:
+        big_burst_score += score2
+
+    if score3 == 200:
+        single_clears += 1
+    if score3 == 500:
+        double_clears += 1
+    if score3 >= 1000:
+        big_burst_score += score3
+
+    if score4 == 200:
+        single_clears += 1
+    if score4 == 500:
+        double_clears += 1
+    if score4 >= 1000:
+        big_burst_score += score4
+
+    empty_spaces = 0
+    for i in range(64):
+        if board_after[i] == 0:
+            empty_spaces += 1
+
+    tactical_score = 0.0
+    if empty_spaces < 20:
+        tactical_score += total_game_score * 6.0
+        tactical_score += double_clears * 150.0
+        tactical_score += big_burst_score * 3.0
+        tactical_score -= single_clears * 50.0
+    elif empty_spaces < 28:
+        tactical_score -= single_clears * 700.0
+        tactical_score += double_clears * 120.0
+        tactical_score += big_burst_score * 5.0
+        tactical_score += total_game_score * 0.6
+    else:
+        tactical_score -= single_clears * 1200.0
+        tactical_score -= double_clears * 900.0
+        tactical_score += big_burst_score * 8.0
+        tactical_score += (40.0 - empty_spaces) * 35.0
+
+    return base_eval + tactical_score, total_game_score
+
+
+@njit(fastmath=True, nogil=True)
+def _solve_turn_core_2(board, pieces, use_anchor_prune):
+    best_eval = NO_SOLUTION_EVAL
+    best_moves = np.full((4, 3), -1, dtype=np.int32)
     best_game_score = 0
-    
+
+    for perm_idx in range(2):
+        order = PERMS_2[perm_idx]
+        p1 = pieces[order[0]]
+        for r1 in range(8):
+            for c1 in range(8):
+                if not _check_fit(board, p1, r1, c1):
+                    continue
+                if use_anchor_prune and not _is_anchored(board, p1, r1, c1):
+                    continue
+                b1, score1 = _place_and_clear(board, p1, r1, c1)
+
+                p2 = pieces[order[1]]
+                for r2 in range(8):
+                    for c2 in range(8):
+                        if not _check_fit(b1, p2, r2, c2):
+                            continue
+                        if use_anchor_prune and not _is_anchored(b1, p2, r2, c2):
+                            continue
+                        b2, score2 = _place_and_clear(b1, p2, r2, c2)
+
+                        final_eval, total_game_score = _compose_final_eval(b2, score1, score2, 0, 0)
+                        if final_eval > best_eval:
+                            best_eval = final_eval
+                            best_game_score = total_game_score
+                            best_moves[0] = [order[0], r1, c1]
+                            best_moves[1] = [order[1], r2, c2]
+
+    return best_eval, best_game_score, best_moves
+
+
+@njit(fastmath=True, nogil=True)
+def _solve_turn_core_3(board, pieces, use_anchor_prune):
+    best_eval = NO_SOLUTION_EVAL
+    best_moves = np.full((4, 3), -1, dtype=np.int32)
+    best_game_score = 0
+
+    for perm_idx in range(6):
+        order = PERMS_3[perm_idx]
+        p1 = pieces[order[0]]
+        for r1 in range(8):
+            for c1 in range(8):
+                if not _check_fit(board, p1, r1, c1):
+                    continue
+                if use_anchor_prune and not _is_anchored(board, p1, r1, c1):
+                    continue
+                b1, score1 = _place_and_clear(board, p1, r1, c1)
+
+                p2 = pieces[order[1]]
+                for r2 in range(8):
+                    for c2 in range(8):
+                        if not _check_fit(b1, p2, r2, c2):
+                            continue
+                        if use_anchor_prune and not _is_anchored(b1, p2, r2, c2):
+                            continue
+                        b2, score2 = _place_and_clear(b1, p2, r2, c2)
+
+                        p3 = pieces[order[2]]
+                        for r3 in range(8):
+                            for c3 in range(8):
+                                if not _check_fit(b2, p3, r3, c3):
+                                    continue
+                                if use_anchor_prune and not _is_anchored(b2, p3, r3, c3):
+                                    continue
+                                b3, score3 = _place_and_clear(b2, p3, r3, c3)
+
+                                final_eval, total_game_score = _compose_final_eval(b3, score1, score2, score3, 0)
+                                if final_eval > best_eval:
+                                    best_eval = final_eval
+                                    best_game_score = total_game_score
+                                    best_moves[0] = [order[0], r1, c1]
+                                    best_moves[1] = [order[1], r2, c2]
+                                    best_moves[2] = [order[2], r3, c3]
+
+    return best_eval, best_game_score, best_moves
+
+
+@njit(fastmath=True, nogil=True)
+def _solve_turn_core_4(board, pieces, use_anchor_prune):
+    best_eval = NO_SOLUTION_EVAL
+    best_moves = np.full((4, 3), -1, dtype=np.int32)
+    best_game_score = 0
+
     for perm_idx in range(24):
         order = PERMS_4[perm_idx]
         p1 = pieces[order[0]]
         for r1 in range(8):
             for c1 in range(8):
-                if not _check_fit(board, p1, r1, c1): continue
-                if use_anchor_prune and not _is_anchored(board, p1, r1, c1): continue
+                if not _check_fit(board, p1, r1, c1):
+                    continue
+                if use_anchor_prune and not _is_anchored(board, p1, r1, c1):
+                    continue
                 b1, score1 = _place_and_clear(board, p1, r1, c1)
-                
+
                 p2 = pieces[order[1]]
                 for r2 in range(8):
                     for c2 in range(8):
-                        if not _check_fit(b1, p2, r2, c2): continue
-                        if use_anchor_prune and not _is_anchored(b1, p2, r2, c2): continue
+                        if not _check_fit(b1, p2, r2, c2):
+                            continue
+                        if use_anchor_prune and not _is_anchored(b1, p2, r2, c2):
+                            continue
                         b2, score2 = _place_and_clear(b1, p2, r2, c2)
-                        
+
                         p3 = pieces[order[2]]
                         for r3 in range(8):
                             for c3 in range(8):
-                                if not _check_fit(b2, p3, r3, c3): continue
-                                if use_anchor_prune and not _is_anchored(b2, p3, r3, c3): continue
+                                if not _check_fit(b2, p3, r3, c3):
+                                    continue
+                                if use_anchor_prune and not _is_anchored(b2, p3, r3, c3):
+                                    continue
                                 b3, score3 = _place_and_clear(b2, p3, r3, c3)
-                                
+
                                 p4 = pieces[order[3]]
                                 for r4 in range(8):
                                     for c4 in range(8):
-                                        if not _check_fit(b3, p4, r4, c4): continue
-                                        if use_anchor_prune and not _is_anchored(b3, p4, r4, c4): continue
+                                        if not _check_fit(b3, p4, r4, c4):
+                                            continue
+                                        if use_anchor_prune and not _is_anchored(b3, p4, r4, c4):
+                                            continue
                                         b4, score4 = _place_and_clear(b3, p4, r4, c4)
 
-                                        base_eval = _evaluate_board(b4)
-                                        total_game_score = score1 + score2 + score3 + score4
-
-                                        single_clears = 0
-                                        double_clears = 0
-                                        big_burst_score = 0
-                                        if score1 == 200: single_clears += 1
-                                        if score1 == 500: double_clears += 1
-                                        if score1 >= 1000: big_burst_score += score1
-                                        if score2 == 200: single_clears += 1
-                                        if score2 == 500: double_clears += 1
-                                        if score2 >= 1000: big_burst_score += score2
-                                        if score3 == 200: single_clears += 1
-                                        if score3 == 500: double_clears += 1
-                                        if score3 >= 1000: big_burst_score += score3
-                                        if score4 == 200: single_clears += 1
-                                        if score4 == 500: double_clears += 1
-                                        if score4 >= 1000: big_burst_score += score4
-
-                                        empty_spaces = 0
-                                        for i in range(64):
-                                            if b4[i] == 0:
-                                                empty_spaces += 1
-
-                                        tactical_score = 0.0
-                                        if empty_spaces < 20:
-                                            tactical_score += total_game_score * 6.0
-                                            tactical_score += double_clears * 150.0
-                                            tactical_score += big_burst_score * 3.0
-                                            tactical_score -= single_clears * 50.0
-                                        elif empty_spaces < 28:
-                                            tactical_score -= single_clears * 700.0
-                                            tactical_score += double_clears * 120.0
-                                            tactical_score += big_burst_score * 5.0
-                                            tactical_score += total_game_score * 0.6
-                                        else:
-                                            tactical_score -= single_clears * 1200.0
-                                            tactical_score -= double_clears * 900.0
-                                            tactical_score += big_burst_score * 8.0
-                                            tactical_score += (40.0 - empty_spaces) * 35.0
-
-                                        final_eval = base_eval + tactical_score
-                                        
+                                        final_eval, total_game_score = _compose_final_eval(b4, score1, score2, score3, score4)
                                         if final_eval > best_eval:
                                             best_eval = final_eval
                                             best_game_score = total_game_score
@@ -284,20 +396,30 @@ def _solve_turn_core(board, pieces, use_anchor_prune):
                                             best_moves[1] = [order[1], r2, c2]
                                             best_moves[2] = [order[2], r3, c3]
                                             best_moves[3] = [order[3], r4, c4]
-                                            
+
     return best_eval, best_game_score, best_moves
 
 
 @njit(fastmath=True, nogil=True)
-def _solve_turn(board, pieces):
-    # 空盘或近空盘时优先启用锚点剪枝；若剪枝后无解则回退全搜索，避免误杀最优解
+def _solve_turn(board, pieces, piece_count):
+    # 空盘或近空盘时优先启用锚点剪枝；若剪枝后无解则回退全搜索，避免误杀最优解。
     empty_spaces = _count_empty_spaces(board)
+
     if empty_spaces >= 40:
-        best_eval, best_game_score, best_moves = _solve_turn_core(board, pieces, True)
+        if piece_count == 2:
+            best_eval, best_game_score, best_moves = _solve_turn_core_2(board, pieces, True)
+        elif piece_count == 3:
+            best_eval, best_game_score, best_moves = _solve_turn_core_3(board, pieces, True)
+        else:
+            best_eval, best_game_score, best_moves = _solve_turn_core_4(board, pieces, True)
         if best_eval != NO_SOLUTION_EVAL:
             return best_eval, best_game_score, best_moves
 
-    return _solve_turn_core(board, pieces, False)
+    if piece_count == 2:
+        return _solve_turn_core_2(board, pieces, False)
+    if piece_count == 3:
+        return _solve_turn_core_3(board, pieces, False)
+    return _solve_turn_core_4(board, pieces, False)
 
 # --- API 协议 ---
 class SolveRequest(BaseModel):
@@ -467,8 +589,9 @@ def _solve_with_steps(
     profiling_enabled = _should_profile(enable_profiling)
     total_started = time.perf_counter()
 
-    if len(blocks) != 4:
-        result = {"status": "fail", "msg": "参数校验失败：必须提供 4 个方块"}
+    piece_count = int(len(blocks))
+    if piece_count < 2 or piece_count > 4:
+        result = {"status": "fail", "msg": "参数校验失败：方块数量必须在 2~4 之间"}
         if profiling_enabled:
             result["perf"] = {"enabled": True, "solve_total_ms": _round_ms((time.perf_counter() - total_started) * 1000.0)}
         _record_turn_data(board, blocks, source, result)
@@ -500,10 +623,10 @@ def _solve_with_steps(
     pieces_pack_ms = (time.perf_counter() - pieces_pack_started) * 1000.0
 
     solve_started = time.perf_counter()
-    eval_score, game_score, moves = _solve_turn(board_1d, pieces_arr)
+    eval_score, game_score, moves = _solve_turn(board_1d, pieces_arr, piece_count)
     solve_core_ms = (time.perf_counter() - solve_started) * 1000.0
     if eval_score == NO_SOLUTION_EVAL:
-        result = {"status": "fail", "msg": "Game Over：当前盘面下这4个方块无法全部放置。"}
+        result = {"status": "fail", "msg": f"Game Over：当前盘面下这 {piece_count} 个方块无法全部放置。"}
         if profiling_enabled:
             result["perf"] = {
                 "enabled": True,
@@ -519,8 +642,11 @@ def _solve_with_steps(
     build_steps_started = time.perf_counter()
     steps = []
     current_sim_board = board_1d.copy()
-    for move in moves:
+    for i in range(piece_count):
+        move = moves[i]
         b_idx, r, c = int(move[0]), int(move[1]), int(move[2])
+        if b_idx < 0 or b_idx >= piece_count:
+            continue
         piece_coords = blocks[b_idx]
 
         board_before = current_sim_board.tolist()
@@ -766,11 +892,11 @@ def api_auto_recognize():
     try:
         started = time.perf_counter()
         blocks = extract_blocks_from_memory(CURRENT_BBOX)
-        if len(blocks) != 4:
+        if len(blocks) < 2 or len(blocks) > 4:
             result = {
                 "status": "fail",
                 "msg": (
-                    f"识别数量异常：检测到 {len(blocks)} 个槽位，期望值为 4。"
+                    f"识别数量异常：检测到 {len(blocks)} 个槽位，期望值为 2~4。"
                     "请确保框选区域干净且包含所有方块。"
                     "已在项目根目录保存调试截图（cv_capture_1.png ~ cv_capture_3.png，自动轮转覆盖）。"
                 ),
@@ -783,7 +909,7 @@ def api_auto_recognize():
                 _record_perf_log("recognize_blocks", result, True)
             return result
 
-        result = {"status": "success", "blocks": blocks}
+        result = {"status": "success", "blocks": blocks, "slot_count": len(blocks)}
         if PERF_ANALYSIS_ENABLED:
             result["perf"] = {
                 "enabled": True,

@@ -378,8 +378,24 @@ def execute_solution_steps(
     recognize_started = time.perf_counter()
     slot_details = extract_blocks_with_screen_points(tuple(int(v) for v in capture_bbox))
     recognize_ms = (time.perf_counter() - recognize_started) * 1000.0
-    if len(slot_details) != 4:
-        return {"status": "fail", "msg": f"执行器识别异常：检测到 {len(slot_details)} 个槽位，期望 4 个。"}
+    if len(slot_details) < 2 or len(slot_details) > 4:
+        return {"status": "fail", "msg": f"执行器识别异常：检测到 {len(slot_details)} 个槽位，期望 2~4 个。"}
+
+    required_indexes = []
+    for step in steps:
+        try:
+            required_indexes.append(int(step.get("block_index", -1)))
+        except Exception:
+            required_indexes.append(-1)
+    max_required_index = max(required_indexes) if required_indexes else -1
+    if max_required_index >= len(slot_details):
+        return {
+            "status": "fail",
+            "msg": (
+                f"执行器识别异常：步骤引用最大 block_index={max_required_index}，"
+                f"但当前仅识别到 {len(slot_details)} 个槽位。"
+            ),
+        }
 
     input_backend = None
     backend_name = "dry-run"

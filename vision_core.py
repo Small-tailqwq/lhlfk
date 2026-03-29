@@ -520,6 +520,43 @@ def _recover_square_from_low_fill_strips(mask, raw_blobs, rejected_blobs, base_s
     return recovered
 
 
+def _infer_slot_layout(cap_h, cap_w):
+    """根据框选区域长宽比估算候选槽位数量与裁切布局（支持 2/3/4）。"""
+    h = float(max(1, cap_h))
+    w = float(max(1, cap_w))
+    ratio = h / w
+
+    # 经验阈值：2 候选约 2.1，3 候选约 3.2，4 候选约 4.3。
+    if ratio < 2.65:
+        slot_count = 2
+    elif ratio < 3.75:
+        slot_count = 3
+    else:
+        slot_count = 4
+
+    # 先按“单槽近似正方形（高≈宽）”反推间隙。
+    slot_h = w
+    if slot_count <= 1:
+        gap_h = 0.0
+    else:
+        gap_h = (h - slot_h * slot_count) / float(slot_count - 1)
+
+    # 负间隙过大说明框选比例偏离理想值，回退到固定间隙比方案。
+    if slot_count > 1 and gap_h < -w * 0.15:
+        gap_ratio = 0.10
+        slot_h = h / float(slot_count + (slot_count - 1) * gap_ratio)
+        gap_h = slot_h * gap_ratio
+
+    if slot_h <= 1.0:
+        slot_h = max(1.0, h / float(slot_count))
+    if gap_h < 0:
+        gap_h = 0.0
+
+    used_h = slot_h * slot_count + gap_h * max(slot_count - 1, 0)
+    offset_y = max(0.0, (h - used_h) * 0.5)
+    return int(slot_count), float(slot_h), float(gap_h), float(offset_y)
+
+
 def _detect_blocks_in_crop(crop_img, debug_run_id, slot_idx, tail_img=None):
     """对单个候选区裁图进行方块识别，返回归一化坐标 [[row, col], ...]"""
     img_h, img_w = crop_img.shape[:2]
@@ -676,13 +713,7 @@ def _detect_blocks_in_crop(crop_img, debug_run_id, slot_idx, tail_img=None):
 
 
 def extract_blocks_from_memory(bbox):
-    """静默截图，先按固定比例裁切 4 个候选区，再分别识别归一化坐标。
-
-    布局规律：
-      - 每个候选区为正方形，高度 = 图片宽度
-      - 无用区高度 = (总高 - 宽 × 4) / 3
-      - 顺序：候选区 - 无用区 - 候选区 - 无用区 - 候选区 - 无用区 - 候选区
-    """
+    """静默截图，按框选长宽比自适应裁切 2/3/4 个候选区并识别归一化坐标。"""
     pil_img = ImageGrab.grab(bbox=bbox)
     img_np = np.array(pil_img)
     img_cv2 = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
@@ -691,8 +722,7 @@ def extract_blocks_from_memory(bbox):
     _save_tmp_step(debug_run_id, "01_capture_bgr", img_cv2)
 
     img_h, img_w = img_cv2.shape[:2]
-    slot_h = img_w                              # 每个候选区高度 = 图片宽度
-    gap_h = (img_h - slot_h * 4) / 3.0         # 无用区高度
+    slot_count, slot_h, gap_h, offset_y = _infer_slot_layout(img_h, img_w)
 
     # 在全图上标注裁切线，方便调试
     crop_vis = img_cv2.copy()
@@ -701,8 +731,8 @@ def extract_blocks_from_memory(bbox):
     # 仅将下方 tail 作为“4x1->5x1”补偿输入，主识别仍使用纯正方形候选区，避免污染。
     extra_h = int(slot_h * 0.35)
 
-    for i in range(4):
-        y1 = int(round(i * (slot_h + gap_h)))
+    for i in range(slot_count):
+        y1 = int(round(offset_y + i * (slot_h + gap_h)))
         y2_base = int(round(y1 + slot_h))
         y2_tail = min(y2_base + extra_h, img_h)
         # 调试图：原始 slot 边界用青色，tail 区用橙色
@@ -731,15 +761,14 @@ def extract_blocks_with_screen_points(bbox):
     x1, y1, x2, y2 = [int(v) for v in bbox]
     cap_w = max(1, x2 - x1)
     cap_h = max(1, y2 - y1)
-    slot_h = cap_w
-    gap_h = (cap_h - slot_h * 4) / 3.0 if cap_h > slot_h * 4 else 0.0
+    slot_count, slot_h, gap_h, offset_y = _infer_slot_layout(cap_h, cap_w)
 
     # UI 中单格最大可达 5 格，使用 slot 宽度/5 估算中心步长。
     cell_step = cap_w / 5.0
     slot_details = []
 
-    for i in range(4):
-        sy1 = int(round(y1 + i * (slot_h + gap_h)))
+    for i in range(slot_count):
+        sy1 = int(round(y1 + offset_y + i * (slot_h + gap_h)))
         sy2 = int(round(sy1 + slot_h))
         slot_bbox = [x1, sy1, x2, sy2]
 

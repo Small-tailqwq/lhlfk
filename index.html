@@ -511,7 +511,7 @@
                 // 直接覆盖当前队列
                 currentBlocks = data.blocks;
                 renderQueue();
-                logEl.innerHTML += `[系统] 已将 4 个方块推入预备队列，可立即执行演算。\n`;
+                logEl.innerHTML += `[系统] 已将 ${currentBlocks.length} 个方块推入预备队列，可立即执行演算。\n`;
                 appendPerfLog('预备区识别', data.perf);
                 return true;
             } else {
@@ -527,7 +527,7 @@
 
     // --- 回放引擎核心逻辑 ---
     async function runEngine() {
-        if(currentBlocks.length !== 4) return alert("必须放满 4 个方块才能演算！");
+        if(currentBlocks.length < 2 || currentBlocks.length > 4) return alert("方块数量需为 2~4 个才能演算！");
         
         document.getElementById('btnSolve').innerText = "演算中...";
         
@@ -708,7 +708,7 @@
 
     // 准备当前步骤（显示将要掉落的方块高亮）
     function prepareStepView() {
-        if(currentStepIndex >= 4) {
+        if(currentStepIndex >= playbackSteps.length) {
             // 本轮结束处理
             document.getElementById('stepInfo').innerText = "🎉 演算完成！";
             const btn = document.getElementById('btnNextStep');
@@ -758,9 +758,14 @@
     // 完成本回合，更新主逻辑，允许新一轮输入
     async function finishRound() {
         const logEl = document.getElementById('log');
+
+        if(!playbackSteps || playbackSteps.length === 0) {
+            logEl.innerHTML += "[系统] 本轮无可回放步骤，已跳过。\n";
+            return;
+        }
         
         // 1. 将物理状态同步到主 boardState
-        boardState = _1dTo2d(playbackSteps[3].board_after);
+        boardState = _1dTo2d(playbackSteps[playbackSteps.length - 1].board_after);
         
         const selectedProfile = document.querySelector('input[name="timingProfile"]:checked');
         const profile = selectedProfile ? selectedProfile.value : 'safe';
@@ -787,8 +792,8 @@
             return;
         }
 
-        if(currentBlocks.length !== 4) {
-            logEl.innerHTML += `[系统] 自动流程终止：识别到 ${currentBlocks.length} 个方块，需 4 个。\n`;
+        if(currentBlocks.length < 2 || currentBlocks.length > 4) {
+            logEl.innerHTML += `[系统] 自动流程终止：识别到 ${currentBlocks.length} 个方块，需 2~4 个。\n`;
             return;
         }
 
