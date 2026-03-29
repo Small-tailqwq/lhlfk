@@ -842,10 +842,11 @@ def _detect_crop_regions(img_cv2):
     """通过图像水平色彩投影检测分离候补块槽位，适配任意拉伸误差与分辨率"""
     img_h, img_w = img_cv2.shape[:2]
     hsv = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2HSV)
+    hue = hsv[:, :, 0]
     sat = hsv[:, :, 1]
     val = hsv[:, :, 2]
     
-    mask = np.where((sat > 70) & (val > 70), 255, 0).astype(np.uint8)
+    mask = np.where((hue > 100) & (hue < 160) & (sat > 70) & (val > 70), 255, 0).astype(np.uint8)
     kernel = np.ones((3, 3), dtype=np.uint8)
     mask = cv2.medianBlur(mask, 3)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
