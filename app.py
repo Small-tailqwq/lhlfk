@@ -49,7 +49,7 @@ def _check_fit(board, piece, r, c):
         if pr == -1: break
         nr, nc = r + pr, c + pc
         if nr < 0 or nr >= 8 or nc < 0 or nc >= 8: return False
-        if board[nr * 8 + nc] == 1: return False
+        if board[nr * 8 + nc] > 0: return False
     return True
 
 
@@ -64,13 +64,13 @@ def _is_anchored(board, piece, r, c):
         if nr == 0 or nr == 7 or nc == 0 or nc == 7:
             return True
 
-        if nr > 0 and board[(nr - 1) * 8 + nc] == 1:
+        if nr > 0 and board[(nr - 1) * 8 + nc] > 0:
             return True
-        if nr < 7 and board[(nr + 1) * 8 + nc] == 1:
+        if nr < 7 and board[(nr + 1) * 8 + nc] > 0:
             return True
-        if nc > 0 and board[nr * 8 + nc - 1] == 1:
+        if nc > 0 and board[nr * 8 + nc - 1] > 0:
             return True
-        if nc < 7 and board[nr * 8 + nc + 1] == 1:
+        if nc < 7 and board[nr * 8 + nc + 1] > 0:
             return True
 
     return False
@@ -114,11 +114,24 @@ def _place_and_clear(board, piece, r, c):
     for row in range(8):
         if rows_to_clear[row]:
             cleared_lines += 1
-            for col in range(8): new_board[row * 8 + col] = 0
     for col in range(8):
         if cols_to_clear[col]:
             cleared_lines += 1
-            for row in range(8): new_board[row * 8 + col] = 0
+
+    # 清行规则：
+    # - 1(普通块) 被清除 -> 0
+    # - 2(不可消除块) 保持 2
+    # - 3(强化块) 第一次被清除 -> 1，第二次再清除才会消失
+    for row in range(8):
+        for col in range(8):
+            if not rows_to_clear[row] and not cols_to_clear[col]:
+                continue
+            idx = row * 8 + col
+            cell = new_board[idx]
+            if cell == 1:
+                new_board[idx] = 0
+            elif cell == 3:
+                new_board[idx] = 1
             
     return new_board, _get_clear_score(cleared_lines)
 
@@ -136,6 +149,7 @@ def _evaluate_board(board):
             idx = r * 8 + c
             cell = board[idx]
 
+            cell_occ = 1 if cell > 0 else 0
             if cell == 0:
                 empty_spaces += 1
                 is_hole = True
@@ -148,10 +162,14 @@ def _evaluate_board(board):
             else:
                 row_sum += 1
 
-            if c < 7 and cell != board[idx + 1]:
-                transitions += 1
-            if r < 7 and cell != board[idx + 8]:
-                transitions += 1
+            if c < 7:
+                right_occ = 1 if board[idx + 1] > 0 else 0
+                if cell_occ != right_occ:
+                    transitions += 1
+            if r < 7:
+                down_occ = 1 if board[idx + 8] > 0 else 0
+                if cell_occ != down_occ:
+                    transitions += 1
 
         if row_sum == 6 or row_sum == 7:
             almost_full_lines += 1
@@ -159,7 +177,8 @@ def _evaluate_board(board):
     for c in range(8):
         col_sum = 0
         for r in range(8):
-            col_sum += board[r * 8 + c]
+            if board[r * 8 + c] > 0:
+                col_sum += 1
         if col_sum == 6 or col_sum == 7:
             almost_full_lines += 1
 
@@ -168,7 +187,7 @@ def _evaluate_board(board):
             is_3x3_empty = True
             for i in range(3):
                 for j in range(3):
-                    if board[(r + i) * 8 + (c + j)] == 1:
+                    if board[(r + i) * 8 + (c + j)] > 0:
                         is_3x3_empty = False
                         break
                 if not is_3x3_empty:
@@ -981,8 +1000,16 @@ def api_recognize_board():
     try:
         started = time.perf_counter()
         board = extract_board_from_memory(BOARD_BBOX)
-        filled = sum(board[r][c] for r in range(8) for c in range(8))
-        result = {"status": "success", "board": board, "filled_count": filled}
+        filled = sum(1 for r in range(8) for c in range(8) if int(board[r][c]) > 0)
+        indestructible = sum(1 for r in range(8) for c in range(8) if int(board[r][c]) == 2)
+        durable = sum(1 for r in range(8) for c in range(8) if int(board[r][c]) == 3)
+        result = {
+            "status": "success",
+            "board": board,
+            "filled_count": filled,
+            "indestructible_count": indestructible,
+            "durable_count": durable,
+        }
         if PERF_ANALYSIS_ENABLED:
             result["perf"] = {
                 "enabled": True,

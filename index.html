@@ -10,9 +10,77 @@
         
         /* 主棋盘 */
         .board { display: grid; grid-template-columns: repeat(8, 40px); grid-gap: 2px; border: 2px solid #555; padding: 2px; width: max-content; margin-bottom: 10px;}
-        .cell { width: 40px; height: 40px; background: #3a3a4c; cursor: pointer; border-radius: 3px; transition: 0.2s; }
-        .cell.filled { background: #ffd043; box-shadow: inset 0 0 8px rgba(255,160,0,0.6); }
+        .cell { width: 40px; height: 40px; background: #3a3a4c; cursor: pointer; border-radius: 3px; transition: 0.2s; position: relative; overflow: hidden; }
+        .cell.type-normal { background: #ffd043; box-shadow: inset 0 0 8px rgba(255,160,0,0.6); }
+        .cell.type-indestructible {
+            background: linear-gradient(145deg, #8f9399 0%, #686d74 100%);
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.15), inset 0 0 10px rgba(0,0,0,0.35);
+        }
+        .cell.type-durable {
+            background:
+                radial-gradient(circle at 75% 25%, rgba(255, 245, 205, 0.85) 0%, rgba(255, 245, 205, 0) 28%),
+                linear-gradient(145deg, #ffbe69 0%, #ff7f3a 52%, #ef5d2f 100%);
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.2), inset 0 0 10px rgba(123,39,0,0.35);
+        }
+        .cell.type-durable::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: repeating-linear-gradient(130deg, rgba(255,255,255,0.05) 0 3px, rgba(0,0,0,0.08) 3px 6px);
+            pointer-events: none;
+        }
+        .cell-code {
+            position: absolute;
+            top: 2px;
+            right: 3px;
+            font-size: 10px;
+            line-height: 1;
+            padding: 1px 3px;
+            border-radius: 3px;
+            font-weight: 700;
+            color: #f1f5f9;
+            background: rgba(0,0,0,0.35);
+            z-index: 2;
+            pointer-events: none;
+        }
         .cell.highlight { background: #00ffcc; box-shadow: 0 0 10px #00ffcc; transform: scale(0.95); border-radius: 6px; } /* 回放时即将落下的方块 */
+        .board-legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            margin-bottom: 10px;
+            font-size: 12px;
+            color: #cbd5e1;
+        }
+        .legend-item {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 3px 8px;
+            background: rgba(0,0,0,0.2);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 999px;
+        }
+        .legend-swatch {
+            width: 13px;
+            height: 13px;
+            border-radius: 3px;
+            display: inline-block;
+        }
+        .legend-normal { background: #ffd043; }
+        .legend-indestructible { background: linear-gradient(145deg, #8f9399 0%, #686d74 100%); }
+        .legend-durable { background: linear-gradient(145deg, #ffbe69 0%, #ef5d2f 100%); }
+        .board-stats {
+            margin-bottom: 8px;
+            font-size: 12px;
+            color: #9ad9ff;
+        }
+        .board-hint {
+            margin-top: 6px;
+            margin-bottom: 0;
+            font-size: 11px;
+            color: #94a3b8;
+        }
         
         /* 绘制板与图鉴库 */
         .drawer { display: grid; grid-template-columns: repeat(5, 25px); grid-gap: 2px; border: 2px solid #00ffcc; padding: 2px; width: max-content; margin: 0 auto 10px auto;}
@@ -49,10 +117,17 @@
 
 <div class="panel">
     <h2>1. 游戏主棋盘 (动态交互)</h2>
+    <div class="board-legend">
+        <span class="legend-item"><span class="legend-swatch legend-normal"></span>普通块 N(1)</span>
+        <span class="legend-item"><span class="legend-swatch legend-indestructible"></span>灰锁块 X(2)</span>
+        <span class="legend-item"><span class="legend-swatch legend-durable"></span>二次块 2(3)</span>
+    </div>
+    <div class="board-stats" id="boardTypeStats">状态统计：N=0, X=0, 2次=0, 占用=0</div>
     <div class="board" id="boardGrid"></div>
     <div class="btn-group" id="boardControls">
         <button onclick="clearBoard()">清空主棋盘</button>
     </div>
+    <p class="board-hint">左键切换空/普通块，右键循环 空→普通→灰锁→二次，用于核对识别类型。</p>
     
     <div id="playbackPanel">
         <div class="step-indicator" id="stepInfo">准备回放...</div>
@@ -150,6 +225,33 @@
     // --- 初始化组件 ---
     const boardGridEl = document.getElementById('boardGrid');
     const drawerGridEl = document.getElementById('drawerGrid');
+    const boardTypeStatsEl = document.getElementById('boardTypeStats');
+
+    function summarizeBoardStates(board) {
+        let normal = 0;
+        let indestructible = 0;
+        let durable = 0;
+        for(let r=0; r<8; r++) {
+            for(let c=0; c<8; c++) {
+                const s = Number(board[r][c] || 0);
+                if(s === 1) normal++;
+                else if(s === 2) indestructible++;
+                else if(s === 3) durable++;
+            }
+        }
+        return {
+            normal,
+            indestructible,
+            durable,
+            occupied: normal + indestructible + durable,
+        };
+    }
+
+    function updateBoardTypeStats(board = boardState) {
+        if(!boardTypeStatsEl) return;
+        const s = summarizeBoardStates(board);
+        boardTypeStatsEl.innerText = `状态统计：N=${s.normal}, X=${s.indestructible}, 2次=${s.durable}, 占用=${s.occupied}`;
+    }
 
     function renderBoard(customBoard = null, highlightCoords = []) {
         boardGridEl.innerHTML = '';
@@ -159,22 +261,44 @@
             for(let c=0; c<8; c++) {
                 const cell = document.createElement('div');
                 cell.className = 'cell';
+                const state = Number(targetBoard[r][c] || 0);
                 
                 // 检查是否为高亮块
                 const isHighlight = highlightCoords.some(pt => pt[0] === r && pt[1] === c);
                 if (isHighlight) {
                     cell.classList.add('highlight');
-                } else if (targetBoard[r][c] === 1) {
-                    cell.classList.add('filled');
+                } else if (state === 1) {
+                    cell.classList.add('type-normal');
+                } else if (state === 2) {
+                    cell.classList.add('type-indestructible');
+                } else if (state === 3) {
+                    cell.classList.add('type-durable');
+                }
+
+                if(state > 0 && !isHighlight) {
+                    const code = document.createElement('span');
+                    code.className = 'cell-code';
+                    code.innerText = state === 1 ? 'N' : (state === 2 ? 'X' : '2');
+                    cell.appendChild(code);
                 }
 
                 // 只有在非播放模式下才允许手动修改棋盘
                 if(!isPlaying) {
-                    cell.onclick = () => { targetBoard[r][c] ^= 1; renderBoard(); };
+                    cell.onclick = () => {
+                        targetBoard[r][c] = targetBoard[r][c] > 0 ? 0 : 1;
+                        renderBoard();
+                    };
+                    cell.oncontextmenu = (e) => {
+                        e.preventDefault();
+                        const cur = Number(targetBoard[r][c] || 0);
+                        targetBoard[r][c] = (cur + 1) % 4;
+                        renderBoard();
+                    };
                 }
                 boardGridEl.appendChild(cell);
             }
         }
+        updateBoardTypeStats(targetBoard);
     }
     
     function clearBoard() { boardState = Array(8).fill().map(() => Array(8).fill(0)); renderBoard(); }
@@ -486,7 +610,7 @@
             if(data.status === 'success') {
                 boardState = data.board;
                 renderBoard();
-                logEl.innerHTML += `✅ 棋盘识别成功，耗时 ${costT} ms，共 ${data.filled_count} 格有方块。\n`;
+                logEl.innerHTML += `✅ 棋盘识别成功，耗时 ${costT} ms，占用 ${data.filled_count} 格（N约=${Math.max(0, data.filled_count - (data.indestructible_count || 0) - (data.durable_count || 0))} / X=${data.indestructible_count || 0} / 2次=${data.durable_count || 0}）。\n`;
                 appendPerfLog('棋盘识别', data.perf);
             } else {
                 logEl.innerHTML += `❌ ${data.msg}\n`;

@@ -65,7 +65,7 @@ def _snipping_process(queue):
     app.root.destroy()
 
 def extract_board_from_memory(bbox):
-    """截图棋盘区域，识别 8x8 格哪些格子有方块（1），哪些为空（0）。"""
+    """截图棋盘区域并识别 8x8 状态：0空、1普通、2不可消除、3二次消除。"""
     pil_img = ImageGrab.grab(bbox=bbox)
     img_np = np.array(pil_img)
     img_cv2 = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
@@ -80,22 +80,30 @@ def extract_board_from_memory(bbox):
     sat = hsv[:, :, 1].astype(np.float32)
     val = hsv[:, :, 2].astype(np.float32)
 
-    # 棋盘背景为紫色（低饱和/低亮度），实际方块为高饱和高亮度的鲜艳色彩。
-    # 先用宽松阈值生成候选掩码，再在格内用加权得分而非简单二值化。
-    # 宽掩码（采集调试热力图用）：S>55 & V>55
+    # 棋盘背景为紫色（低饱和/低亮度），方块为高亮区域。
     colored_loose = ((sat > 55) & (val > 55)).astype(np.float32)
     _save_tmp_step(debug_run_id, "03_colored_loose", colored_loose)
 
-    # 严格掩码（用于实际判断）：S>110 & V>130，过滤掉背景紫色
-    colored_strict = ((sat > 110) & (val > 130)).astype(np.float32)
+    # 常规彩色方块（蓝/黄/橙等）
+    colored_strict = ((sat > 95) & (val > 95)).astype(np.float32)
     _save_tmp_step(debug_run_id, "03b_colored_strict", colored_strict)
+
+    # 灰色不可消除占位块：低饱和但亮度明显高于背景。
+    gray_block_mask = ((sat < 42) & (val > 80)).astype(np.float32)
+    _save_tmp_step(debug_run_id, "03c_gray_block_mask", gray_block_mask)
+
+    # 二次块不绑定颜色：用高亮+纹理强度做识别。
+    durable_hint_mask = ((sat > 70) & (val > 90)).astype(np.float32)
+    _save_tmp_step(debug_run_id, "03d_durable_hint_mask", durable_hint_mask)
 
     cell_h = h / 8.0
     cell_w = w / 8.0
     margin = 0.18  # 每格四周留 18% 边距，避免格线噪声
+    feature_margin = 0.08  # 二次块纹理特征使用更大 ROI，保留顶部裂纹/高光信息
 
-    # 用于调试的逐格 fill_ratio 热力图
-    heatmap = np.zeros((h, w), dtype=np.float32)
+    heatmap_occupied = np.zeros((h, w), dtype=np.float32)
+    heatmap_gray = np.zeros((h, w), dtype=np.float32)
+    heatmap_durable = np.zeros((h, w), dtype=np.float32)
 
     board = []
     for r in range(8):
@@ -105,16 +113,96 @@ def extract_board_from_memory(bbox):
             y2 = int((r + 1) * cell_h - cell_h * margin)
             x1 = int(c * cell_w + cell_w * margin)
             x2 = int((c + 1) * cell_w - cell_w * margin)
-            roi = colored_strict[y1:y2, x1:x2]
-            fill_ratio = float(roi.mean()) if roi.size > 0 else 0.0
-            heatmap[y1:y2, x1:x2] = fill_ratio
-            row.append(1 if fill_ratio > 0.20 else 0)
+
+            fy1 = int(r * cell_h + cell_h * feature_margin)
+            fy2 = int((r + 1) * cell_h - cell_h * feature_margin)
+            fx1 = int(c * cell_w + cell_w * feature_margin)
+            fx2 = int((c + 1) * cell_w - cell_w * feature_margin)
+
+            roi_colored = colored_strict[y1:y2, x1:x2]
+            roi_gray = gray_block_mask[y1:y2, x1:x2]
+            roi_durable = durable_hint_mask[y1:y2, x1:x2]
+            roi_sat = sat[fy1:fy2, fx1:fx2]
+            roi_val = val[fy1:fy2, fx1:fx2]
+            roi_bgr = img_cv2[fy1:fy2, fx1:fx2]
+
+            fill_colored = float(roi_colored.mean()) if roi_colored.size > 0 else 0.0
+            fill_gray = float(roi_gray.mean()) if roi_gray.size > 0 else 0.0
+            fill_durable_hint = float(roi_durable.mean()) if roi_durable.size > 0 else 0.0
+
+            heatmap_occupied[y1:y2, x1:x2] = fill_colored
+            heatmap_gray[y1:y2, x1:x2] = fill_gray
+
+            state = 0
+            if fill_gray > 0.22 and fill_colored < 0.18:
+                state = 2
+            elif fill_colored > 0.20:
+                # 二次块的主要特征是裂纹纹理与高光对比，不依赖具体颜色。
+                texture_std = 0.0
+                val_std = 0.0
+                bright_ratio = 0.0
+                dark_ratio = 0.0
+                edge_density = 0.0
+                top_dark_ratio = 0.0
+                top_fill = 1.0
+
+                if roi_bgr.size > 0:
+                    roi_gray_img = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+                    lap = cv2.Laplacian(roi_gray_img, cv2.CV_32F)
+                    texture_std = float(np.std(lap))
+                    edge_density = float(np.mean(np.abs(lap) > 18.0))
+                if roi_val.size > 0:
+                    val_std = float(np.std(roi_val))
+                if roi_val.size > 0 and roi_sat.size > 0:
+                    bright_ratio = float(np.mean((roi_val > 220) & (roi_sat < 150)))
+                    dark_ratio = float(np.mean(roi_val < 130))
+                    top_h = max(1, roi_val.shape[0] // 2)
+                    top_dark_ratio = float(np.mean((roi_val[:top_h, :] < 132) & (roi_sat[:top_h, :] < 185)))
+
+                feature_mask = colored_strict[fy1:fy2, fx1:fx2]
+                if feature_mask.size > 0:
+                    top_h_mask = max(1, feature_mask.shape[0] // 2)
+                    top_fill = float(np.mean(feature_mask[:top_h_mask, :]))
+
+                contrast_mix = bright_ratio * dark_ratio
+                crack_gap = max(0.0, fill_durable_hint - fill_colored)
+                top_gap = max(0.0, 1.0 - top_fill)
+
+                durable_score = (
+                    min(texture_std / 75.0, 1.0) * 0.35
+                    + min(val_std / 70.0, 1.0) * 0.25
+                    + min(edge_density / 0.35, 1.0) * 0.25
+                    + min(contrast_mix / 0.08, 1.0) * 0.15
+                )
+                crack_score = min(crack_gap / 0.12, 1.0) * 0.55 + min(top_gap / 0.30, 1.0) * 0.45
+                heatmap_durable[y1:y2, x1:x2] = max(durable_score, crack_score)
+
+                if (
+                    fill_durable_hint > 0.20
+                    and (
+                        (crack_gap > 0.072 and top_gap > 0.16)
+                        or (crack_gap > 0.060 and top_gap > 0.20)
+                        or (texture_std > 13.0 and val_std > 15.0 and edge_density > 0.06 and contrast_mix > 0.004 and durable_score > 0.34)
+                        or (texture_std > 11.0 and top_dark_ratio > 0.035 and durable_score > 0.31)
+                    )
+                ):
+                    state = 3
+                else:
+                    state = 1
+
+            row.append(state)
         board.append(row)
 
-    _save_tmp_step(debug_run_id, "04_fill_heatmap", heatmap)
+    _save_tmp_step(debug_run_id, "04_fill_heatmap_occupied", heatmap_occupied)
+    _save_tmp_step(debug_run_id, "04b_fill_heatmap_gray", heatmap_gray)
+    _save_tmp_step(debug_run_id, "04c_fill_heatmap_durable", heatmap_durable)
 
     # 最终棋盘可视化
-    board_img = np.array(board, dtype=np.uint8) * 255
+    board_arr = np.array(board, dtype=np.uint8)
+    board_img = np.zeros_like(board_arr, dtype=np.uint8)
+    board_img[board_arr == 1] = 170
+    board_img[board_arr == 2] = 220
+    board_img[board_arr == 3] = 255
     board_vis = cv2.resize(board_img, (w, h), interpolation=cv2.INTER_NEAREST)
     _save_tmp_step(debug_run_id, "05_board_binary", board_vis)
 
@@ -126,9 +214,17 @@ def extract_board_from_memory(bbox):
             y2 = int((r + 1) * cell_h)
             x1 = int(c * cell_w)
             x2 = int((c + 1) * cell_w)
-            color = (0, 220, 80) if board[r][c] else (60, 60, 60)
+            state = int(board[r][c])
+            if state == 1:
+                color = (0, 220, 80)
+            elif state == 2:
+                color = (160, 160, 160)
+            elif state == 3:
+                color = (0, 165, 255)
+            else:
+                color = (60, 60, 60)
             cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 1)
-            cv2.putText(overlay, str(board[r][c]), (x1 + 4, y1 + 14),
+            cv2.putText(overlay, str(state), (x1 + 4, y1 + 14),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, color, 1, cv2.LINE_AA)
     _save_tmp_step(debug_run_id, "06_board_overlay", overlay)
 
