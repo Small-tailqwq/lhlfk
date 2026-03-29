@@ -689,7 +689,7 @@ def _detect_blocks_in_crop(crop_img, debug_run_id, slot_idx, tail_img=None):
         if short_side < min_side or area < (min_side * min_side * 0.35) or area > (img_h * img_w * 0.85):
             rejected_blobs.append({"x": x, "y": y, "w": w, "h": h, "fill_ratio": fill_ratio, "area": area})
             continue
-        if fill_ratio < 0.55:
+        if fill_ratio < 0.38:
             rejected_blobs.append({"x": x, "y": y, "w": w, "h": h, "fill_ratio": fill_ratio, "area": area})
             continue
 
