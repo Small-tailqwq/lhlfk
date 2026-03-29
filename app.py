@@ -474,6 +474,9 @@ class SettingsUpdateRequest(BaseModel):
     tmp_debug_enabled: Optional[bool] = None
     perf_analysis_enabled: Optional[bool] = None
     timing_profile: Optional[str] = None
+    record_data_enabled: Optional[bool] = None
+    candidate_count: Optional[int] = None
+    lab_features_enabled: Optional[bool] = None
 
 
 AGENT_LOCK = threading.Lock()
@@ -491,14 +494,26 @@ AGENT_STATE: Dict[str, Any] = {
     "timing_profile": "safe",
     "stop_hotkey": "F8",
     "last_profile": None,
+    "last_board": None,
     "thread": None,
 }
 
 # 全局存储框选坐标（支持持久化）
-CURRENT_BBOX = None
+BBOX_4 = None
+BBOX_3 = None
+BBOX_2 = None
+CANDIDATE_COUNT = 3
+LAB_FEATURES_ENABLED = False
 BOARD_BBOX = None
 TIMING_PROFILE_CHOICE = "safe"
 PERF_ANALYSIS_ENABLED = False
+RECORD_DATA_ENABLED = False
+
+def get_current_bbox():
+    if CANDIDATE_COUNT == 4: return BBOX_4
+    if CANDIDATE_COUNT == 3: return BBOX_3
+    if CANDIDATE_COUNT == 2: return BBOX_2
+    return None
 
 
 def _normalize_bbox(value):
@@ -520,14 +535,19 @@ def _save_settings():
         "tmp_debug_enabled": bool(get_tmp_debug_enabled()),
         "timing_profile": str(TIMING_PROFILE_CHOICE),
         "perf_analysis_enabled": bool(PERF_ANALYSIS_ENABLED),
-        "current_bbox": list(CURRENT_BBOX) if CURRENT_BBOX else None,
+        "record_data_enabled": bool(RECORD_DATA_ENABLED),
+        "candidate_count": int(CANDIDATE_COUNT),
+        "lab_features_enabled": bool(LAB_FEATURES_ENABLED),
+        "bbox_4": list(BBOX_4) if BBOX_4 else None,
+        "bbox_3": list(BBOX_3) if BBOX_3 else None,
+        "bbox_2": list(BBOX_2) if BBOX_2 else None,
         "board_bbox": list(BOARD_BBOX) if BOARD_BBOX else None,
     }
     SETTINGS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _load_settings():
-    global PERF_ANALYSIS_ENABLED, TIMING_PROFILE_CHOICE, CURRENT_BBOX, BOARD_BBOX
+    global PERF_ANALYSIS_ENABLED, TIMING_PROFILE_CHOICE, BBOX_4, BBOX_3, BBOX_2, CANDIDATE_COUNT, LAB_FEATURES_ENABLED, BOARD_BBOX, RECORD_DATA_ENABLED
 
     if not SETTINGS_FILE.exists():
         set_tmp_debug_enabled(False)
@@ -541,10 +561,22 @@ def _load_settings():
 
     set_tmp_debug_enabled(bool(data.get("tmp_debug_enabled", False)))
     PERF_ANALYSIS_ENABLED = bool(data.get("perf_analysis_enabled", False))
+    RECORD_DATA_ENABLED = bool(data.get("record_data_enabled", False))
     choice = str(data.get("timing_profile", "safe")).lower()
     if choice in ("safe", "balanced", "fast"):
         TIMING_PROFILE_CHOICE = choice
-    CURRENT_BBOX = _normalize_bbox(data.get("current_bbox"))
+
+    CANDIDATE_COUNT = int(data.get("candidate_count", 3))
+    LAB_FEATURES_ENABLED = bool(data.get("lab_features_enabled", False))
+    BBOX_4 = _normalize_bbox(data.get("bbox_4"))
+    
+    old_bbox = _normalize_bbox(data.get("current_bbox"))
+    if "bbox_3" in data:
+        BBOX_3 = _normalize_bbox(data.get("bbox_3"))
+    else:
+        BBOX_3 = old_bbox
+
+    BBOX_2 = _normalize_bbox(data.get("bbox_2"))
     BOARD_BBOX = _normalize_bbox(data.get("board_bbox"))
 
 
@@ -552,6 +584,8 @@ _load_settings()
 
 
 def _record_turn_data(board_2d, blocks_3d, source: str, solve_result: Optional[Dict[str, Any]] = None):
+    if not RECORD_DATA_ENABLED:
+        return
     record = {
         "timestamp": time.time(),
         "source": source,
@@ -748,6 +782,7 @@ def _agent_snapshot() -> Dict[str, Any]:
             "timing_profile": AGENT_STATE["timing_profile"],
             "stop_hotkey": AGENT_STATE["stop_hotkey"],
             "last_profile": AGENT_STATE["last_profile"],
+            "last_board": AGENT_STATE.get("last_board"),
         }
 
 
@@ -797,15 +832,17 @@ def _agent_worker(
 
             try:
                 cycle_started = time.perf_counter()
-                if not CURRENT_BBOX or not BOARD_BBOX:
+                current_bbox = get_current_bbox()
+                if not current_bbox or not BOARD_BBOX:
                     raise RuntimeError("代理执行失败：缺少预备区或棋盘框选。")
 
                 board_started = time.perf_counter()
                 board = extract_board_from_memory(BOARD_BBOX)
+                _set_agent_state(last_board=board)
                 board_ms = (time.perf_counter() - board_started) * 1000.0
 
                 blocks_started = time.perf_counter()
-                blocks = extract_blocks_from_memory(CURRENT_BBOX)
+                blocks = extract_blocks_from_memory(current_bbox)
                 blocks_ms = (time.perf_counter() - blocks_started) * 1000.0
 
                 solve_result = _solve_with_steps(board, blocks, source="agent", enable_profiling=PERF_ANALYSIS_ENABLED)
@@ -815,12 +852,13 @@ def _agent_worker(
                 execute_started = time.perf_counter()
                 execute_result = execute_solution_steps(
                     steps=solve_result["steps"],
-                    capture_bbox=CURRENT_BBOX,
+                    capture_bbox=current_bbox,
                     board_bbox=BOARD_BBOX,
                     backend=backend,
                     dry_run=dry_run,
                     timing_profile=timing_profile,
                     enable_profiling=PERF_ANALYSIS_ENABLED,
+                    check_stop=lambda: _is_vk_down(stop_vk) or AGENT_STATE["stop_requested"],
                 )
                 execute_ms = (time.perf_counter() - execute_started) * 1000.0
                 if execute_result.get("status") != "success":
@@ -852,6 +890,9 @@ def _agent_worker(
                     AGENT_STATE["last_error"] = ""
                     AGENT_STATE["last_msg"] = f"第 {AGENT_STATE['cycle_count']} 轮完成。"
                     AGENT_STATE["last_profile"] = cycle_profile
+            except KeyboardInterrupt as e:
+                _set_agent_state(last_error=str(e), last_msg="已成功响应紧急中止指令，正在退出本轮。")
+                break
             except Exception as e:
                 _record_perf_log(
                     "agent_cycle",
@@ -892,25 +933,34 @@ def _agent_worker(
 def solve(req: SolveRequest):
     return _solve_with_steps(req.board, req.blocks, source="api", enable_profiling=PERF_ANALYSIS_ENABLED)
 
-@app.get("/api/set_bbox")
-def api_set_bbox():
-    global CURRENT_BBOX
+@app.get("/api/set_bbox/{count}")
+def api_set_bbox(count: int):
+    global BBOX_4, BBOX_3, BBOX_2, CANDIDATE_COUNT
     bbox = get_screen_bbox()
     if bbox and (bbox[2] - bbox[0] > 10 and bbox[3] - bbox[1] > 10):
-        CURRENT_BBOX = bbox
+        if count == 4:
+            BBOX_4 = bbox
+        elif count == 3:
+            BBOX_3 = bbox
+        elif count == 2:
+            BBOX_2 = bbox
+        else:
+            return {"status": "fail", "msg": f"不支持的候选区数量: {count}"}
+        
+        CANDIDATE_COUNT = count
         _save_settings()
-        return {"status": "success", "bbox": bbox, "msg": f"区域已锁定: {bbox}"}
+        return {"status": "success", "bbox": bbox, "msg": f"{count} 候选区域已锁定: {bbox}"}
     return {"status": "fail", "msg": "框选无效或被取消"}
 
 @app.get("/api/auto_recognize")
 def api_auto_recognize():
-    global CURRENT_BBOX
-    if not CURRENT_BBOX:
-        return {"status": "fail", "msg": "请先点击「1. 框选预备区」设定识别范围！"}
+    current_bbox = get_current_bbox()
+    if not current_bbox:
+        return {"status": "fail", "msg": "请先点击对应候选数的框选预备区设定识别范围！"}
     
     try:
         started = time.perf_counter()
-        blocks = extract_blocks_from_memory(CURRENT_BBOX)
+        blocks = extract_blocks_from_memory(current_bbox)
         if len(blocks) < 2 or len(blocks) > 4:
             result = {
                 "status": "fail",
@@ -959,8 +1009,14 @@ def api_get_settings():
         "settings": {
             "tmp_debug_enabled": bool(get_tmp_debug_enabled()),
             "perf_analysis_enabled": bool(PERF_ANALYSIS_ENABLED),
+            "record_data_enabled": bool(RECORD_DATA_ENABLED),
             "timing_profile": str(TIMING_PROFILE_CHOICE),
-            "current_bbox": list(CURRENT_BBOX) if CURRENT_BBOX else None,
+            "candidate_count": int(CANDIDATE_COUNT),
+            "lab_features_enabled": bool(LAB_FEATURES_ENABLED),
+            "bbox_4": list(BBOX_4) if BBOX_4 else None,
+            "bbox_3": list(BBOX_3) if BBOX_3 else None,
+            "bbox_2": list(BBOX_2) if BBOX_2 else None,
+            "current_bbox": list(get_current_bbox()) if get_current_bbox() else None,
             "board_bbox": list(BOARD_BBOX) if BOARD_BBOX else None,
         },
     }
@@ -969,12 +1025,18 @@ def api_get_settings():
 @app.post("/api/settings")
 @app.put("/api/settings")
 def api_update_settings(req: SettingsUpdateRequest):
-    global PERF_ANALYSIS_ENABLED, TIMING_PROFILE_CHOICE
+    global PERF_ANALYSIS_ENABLED, TIMING_PROFILE_CHOICE, RECORD_DATA_ENABLED, CANDIDATE_COUNT, LAB_FEATURES_ENABLED
     
     if req.tmp_debug_enabled is not None:
         set_tmp_debug_enabled(bool(req.tmp_debug_enabled))
     if req.perf_analysis_enabled is not None:
         PERF_ANALYSIS_ENABLED = bool(req.perf_analysis_enabled)
+    if req.record_data_enabled is not None:
+        RECORD_DATA_ENABLED = bool(req.record_data_enabled)
+    if req.candidate_count is not None:
+        CANDIDATE_COUNT = int(req.candidate_count)
+    if req.lab_features_enabled is not None:
+        LAB_FEATURES_ENABLED = bool(req.lab_features_enabled)
     if req.timing_profile is not None:
         choice = str(req.timing_profile).lower()
         if choice in ("safe", "balanced", "fast"):
@@ -986,8 +1048,14 @@ def api_update_settings(req: SettingsUpdateRequest):
         "settings": {
             "tmp_debug_enabled": bool(get_tmp_debug_enabled()),
             "perf_analysis_enabled": bool(PERF_ANALYSIS_ENABLED),
+            "record_data_enabled": bool(RECORD_DATA_ENABLED),
             "timing_profile": str(TIMING_PROFILE_CHOICE),
-            "current_bbox": list(CURRENT_BBOX) if CURRENT_BBOX else None,
+            "candidate_count": int(CANDIDATE_COUNT),
+            "lab_features_enabled": bool(LAB_FEATURES_ENABLED),
+            "bbox_4": list(BBOX_4) if BBOX_4 else None,
+            "bbox_3": list(BBOX_3) if BBOX_3 else None,
+            "bbox_2": list(BBOX_2) if BBOX_2 else None,
+            "current_bbox": list(get_current_bbox()) if get_current_bbox() else None,
             "board_bbox": list(BOARD_BBOX) if BOARD_BBOX else None,
         },
     }
@@ -1025,10 +1093,11 @@ def api_recognize_board():
 
 @app.post("/api/execute_solution")
 def api_execute_solution(req: ExecuteRequest):
-    global CURRENT_BBOX, BOARD_BBOX
+    global BOARD_BBOX
+    current_bbox = get_current_bbox()
 
-    if not CURRENT_BBOX:
-        return {"status": "fail", "msg": "请先点击「框选预备区」设定识别范围！"}
+    if not current_bbox:
+        return {"status": "fail", "msg": "请先点击对应候选数的框选预备区设定识别范围！"}
     if not BOARD_BBOX:
         return {"status": "fail", "msg": "请先点击「框选棋盘」设定识别范围！"}
     if not req.steps:
@@ -1037,7 +1106,7 @@ def api_execute_solution(req: ExecuteRequest):
     try:
         result = execute_solution_steps(
             steps=[step.dict() for step in req.steps],
-            capture_bbox=CURRENT_BBOX,
+            capture_bbox=current_bbox,
             board_bbox=BOARD_BBOX,
             backend=req.backend,
             dry_run=req.dry_run,
@@ -1061,10 +1130,11 @@ def api_execute_solution(req: ExecuteRequest):
 
 @app.post("/api/agent/start")
 def api_agent_start(req: AgentStartRequest):
-    global CURRENT_BBOX, BOARD_BBOX
+    global BOARD_BBOX
+    current_bbox = get_current_bbox()
 
-    if not CURRENT_BBOX:
-        return {"status": "fail", "msg": "请先点击「框选预备区」设定识别范围！"}
+    if not current_bbox:
+        return {"status": "fail", "msg": "请先点击对应候选数的框选预备区设定识别范围！"}
     if not BOARD_BBOX:
         return {"status": "fail", "msg": "请先点击「框选棋盘」设定识别范围！"}
 

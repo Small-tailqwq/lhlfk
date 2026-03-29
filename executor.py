@@ -1,6 +1,6 @@
 import ctypes
 import time
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Sequence, Tuple
 
 from vision_core import extract_blocks_with_screen_points
 
@@ -273,14 +273,27 @@ def _resolve_timing_profile(profile_name: str) -> Dict[str, float]:
     return TIMING_PROFILES[key]
 
 
-def _drag_mouse(backend: Dict[str, Any], src: Tuple[int, int], dst: Tuple[int, int], timing: Dict[str, float]) -> None:
+def _interruptible_sleep(duration: float, check_stop: Callable[[], bool] = None):
+    if not check_stop:
+        time.sleep(duration)
+        return
+    elapsed = 0.0
+    while elapsed < duration:
+        if check_stop():
+            raise KeyboardInterrupt("用户请求立刻停止执行")
+        step = min(0.01, duration - elapsed)
+        time.sleep(step)
+        elapsed += step
+
+
+def _drag_mouse(backend: Dict[str, Any], src: Tuple[int, int], dst: Tuple[int, int], timing: Dict[str, float], check_stop: Callable[[], bool] = None) -> None:
     sx, sy = src
     dx, dy = dst
 
     backend["move_to"](sx, sy)
-    time.sleep(float(timing["pre_press_sec"]))
+    _interruptible_sleep(float(timing["pre_press_sec"]), check_stop)
     backend["mouse_down"]()
-    time.sleep(float(timing["hold_before_drag_sec"]))
+    _interruptible_sleep(float(timing["hold_before_drag_sec"]), check_stop)
 
     px_span = max(abs(dx - sx), abs(dy - sy))
     min_steps = int(round(float(timing["min_steps"])))
@@ -289,14 +302,17 @@ def _drag_mouse(backend: Dict[str, Any], src: Tuple[int, int], dst: Tuple[int, i
     step_sleep = max(float(timing["travel_sec"]) / max(steps, 1), 0.006)
 
     for i in range(1, steps + 1):
+        if check_stop and check_stop():
+            backend["mouse_up"]()
+            raise KeyboardInterrupt("用户请求立刻停止执行")
         nx = int(round(sx + (dx - sx) * i / steps))
         ny = int(round(sy + (dy - sy) * i / steps))
         backend["move_to"](nx, ny)
-        time.sleep(step_sleep)
+        _interruptible_sleep(step_sleep, check_stop)
 
-    time.sleep(float(timing["hold_after_arrive_sec"]))
+    _interruptible_sleep(float(timing["hold_after_arrive_sec"]), check_stop)
     backend["mouse_up"]()
-    time.sleep(float(timing["release_settle_sec"]))
+    _interruptible_sleep(float(timing["release_settle_sec"]), check_stop)
 
 
 def _drag_mouse_profiled(
@@ -304,6 +320,7 @@ def _drag_mouse_profiled(
     src: Tuple[int, int],
     dst: Tuple[int, int],
     timing: Dict[str, float],
+    check_stop: Callable[[], bool] = None,
 ) -> Dict[str, float]:
     started = time.perf_counter()
     sx, sy = src
@@ -312,9 +329,9 @@ def _drag_mouse_profiled(
     backend["move_to"](sx, sy)
 
     wait_started = time.perf_counter()
-    time.sleep(float(timing["pre_press_sec"]))
+    _interruptible_sleep(float(timing["pre_press_sec"]), check_stop)
     backend["mouse_down"]()
-    time.sleep(float(timing["hold_before_drag_sec"]))
+    _interruptible_sleep(float(timing["hold_before_drag_sec"]), check_stop)
     press_wait_ms = (time.perf_counter() - wait_started) * 1000.0
 
     px_span = max(abs(dx - sx), abs(dy - sy))
@@ -325,16 +342,19 @@ def _drag_mouse_profiled(
 
     move_started = time.perf_counter()
     for i in range(1, steps + 1):
+        if check_stop and check_stop():
+            backend["mouse_up"]()
+            raise KeyboardInterrupt("用户请求立刻停止执行")
         nx = int(round(sx + (dx - sx) * i / steps))
         ny = int(round(sy + (dy - sy) * i / steps))
         backend["move_to"](nx, ny)
-        time.sleep(step_sleep)
+        _interruptible_sleep(step_sleep, check_stop)
     move_ms = (time.perf_counter() - move_started) * 1000.0
 
     release_started = time.perf_counter()
-    time.sleep(float(timing["hold_after_arrive_sec"]))
+    _interruptible_sleep(float(timing["hold_after_arrive_sec"]), check_stop)
     backend["mouse_up"]()
-    time.sleep(float(timing["release_settle_sec"]))
+    _interruptible_sleep(float(timing["release_settle_sec"]), check_stop)
     release_wait_ms = (time.perf_counter() - release_started) * 1000.0
 
     total_ms = (time.perf_counter() - started) * 1000.0
@@ -355,6 +375,7 @@ def execute_solution_steps(
     dry_run: bool = False,
     timing_profile: str = "safe",
     enable_profiling: bool = False,
+    check_stop: Callable[[], bool] = None,
 ) -> Dict[str, Any]:
     total_started = time.perf_counter()
     if not dry_run and not is_running_as_admin():
@@ -445,9 +466,9 @@ def execute_solution_steps(
         clear_wait_ms = 0.0
         if not dry_run and input_backend is not None:
             if enable_profiling:
-                drag_profile = _drag_mouse_profiled(input_backend, src, dst, timing)
+                drag_profile = _drag_mouse_profiled(input_backend, src, dst, timing, check_stop)
             else:
-                _drag_mouse(input_backend, src, dst, timing)
+                _drag_mouse(input_backend, src, dst, timing, check_stop)
 
             inter_wait_started = time.perf_counter()
             time.sleep(float(timing["inter_step_sec"]))

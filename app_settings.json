@@ -2,16 +2,31 @@
   "tmp_debug_enabled": false,
   "timing_profile": "fast",
   "perf_analysis_enabled": false,
-  "current_bbox": [
-    2113,
+  "record_data_enabled": false,
+  "candidate_count": 4,
+  "lab_features_enabled": false,
+  "bbox_4": [
+    2112,
     200,
     2353,
-    1337
+    1334
+  ],
+  "bbox_3": [
+    2113,
+    348,
+    2352,
+    1187
+  ],
+  "bbox_2": [
+    2112,
+    500,
+    2356,
+    1036
   ],
   "board_bbox": [
     664,
-    104,
-    1894,
-    1331
+    103,
+    1892,
+    1328
   ]
 }

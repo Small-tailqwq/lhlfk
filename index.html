@@ -127,7 +127,7 @@
     <div class="btn-group" id="boardControls">
         <button onclick="clearBoard()">清空主棋盘</button>
     </div>
-    <p class="board-hint">左键切换空/普通块，右键循环 空→普通→灰锁→二次，用于核对识别类型。</p>
+    <p class="board-hint" id="boardEditHint" style="display: none;">左键切换空/普通块，右键循环 空→普通→灰锁→二次，用于核对识别类型。</p>
     
     <div id="playbackPanel">
         <div class="step-indicator" id="stepInfo">准备回放...</div>
@@ -138,9 +138,11 @@
 <div class="panel" style="width: 300px;">
     <div style="background: #1e1e2f; padding: 10px; border-radius: 6px; margin-bottom: 15px; border: 1px solid #00ffcc;">
         <h3 style="margin: 0 0 10px 0; font-size: 1rem; color: #00ffcc;">⚡ CV 视觉引擎</h3>
-        <div class="btn-group" style="margin-bottom: 8px;">
-            <button onclick="setCaptureBbox()" style="background: #34495e;">框选预备区</button>
-            <button onclick="autoRecognize()" class="action">识别预备区</button>
+        <div style="display: flex; gap: 4px; margin-bottom: 8px;">
+            <button onclick="setCaptureBbox(4)" style="background: #34495e; font-size: 11px; padding: 6px;">选4区</button>
+            <button onclick="setCaptureBbox(3)" style="background: #34495e; font-size: 11px; padding: 6px;">选3区</button>
+            <button onclick="setCaptureBbox(2)" style="background: #34495e; font-size: 11px; padding: 6px;">选2区</button>
+            <button onclick="autoRecognize()" class="action" style="font-size: 11px; padding: 6px;">识别</button>
         </div>
         <div class="btn-group" style="margin-bottom: 0;">
             <button onclick="setBoardBbox()" style="background: #34495e;">框选棋盘</button>
@@ -158,6 +160,27 @@
             <input type="checkbox" id="chkPerfAnalysis" onchange="onTogglePerfAnalysis()" />
             性能分析模式（记录各环节耗时到 dataset/perf_log.jsonl）
         </label>
+        <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:13px;">
+            <input type="checkbox" id="chkRecordData" onchange="onToggleRecordData()" />
+            收集求解数据 (turn_history.jsonl)
+        </label>
+        <div style="margin-bottom: 10px;">
+            <label style="font-size: 13px; color: #c7d2e8; display: block; margin-bottom: 6px;">💠 当前游戏候选数：</label>
+            <div style="display: flex; gap: 6px;">
+                <label style="display:flex; align-items:center; gap:4px; margin:0; font-size:12px;">
+                    <input type="radio" name="candidateCount" value="4" onchange="onChangeCandidateCount()" />
+                    <span>4候选</span>
+                </label>
+                <label style="display:flex; align-items:center; gap:4px; margin:0; font-size:12px;">
+                    <input type="radio" name="candidateCount" value="3" onchange="onChangeCandidateCount()" />
+                    <span>3候选</span>
+                </label>
+                <label style="display:flex; align-items:center; gap:4px; margin:0; font-size:12px;">
+                    <input type="radio" name="candidateCount" value="2" onchange="onChangeCandidateCount()" />
+                    <span>2候选</span>
+                </label>
+            </div>
+        </div>
         <div style="margin-bottom: 10px;">
             <label style="font-size: 13px; color: #c7d2e8; display: block; margin-bottom: 6px;">⚡ 执行器模式：</label>
             <div style="display: flex; gap: 6px;">
@@ -175,23 +198,31 @@
                 </label>
             </div>
         </div>
+        <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:13px;">
+            <input type="checkbox" id="chkLabFeatures" onchange="onToggleLabFeatures()" />
+            🧪 启用实验室功能 (右键编辑棋盘 / 手动建模图鉴)
+        </label>
         <div style="font-size: 12px; color: #c7d2e8; line-height: 1.5; margin-bottom: 8px;">
-            <div>预备区坐标: <span id="savedCaptureBbox">未保存</span></div>
-            <div>棋盘区坐标: <span id="savedBoardBbox">未保存</span></div>
+            <div>4区坐标: <span id="savedBbox4">未保存</span></div>
+            <div>3区坐标: <span id="savedBbox3">未保存</span></div>
+            <div>2区坐标: <span id="savedBbox2">未保存</span></div>
+            <div>棋盘坐标: <span id="savedBoardBbox">未保存</span></div>
         </div>
         <button onclick="loadSettings(true)" style="background: #44516e; width: 100%;">刷新设置状态</button>
     </div>
 
-    <h2>2. 方块建模绘制 (5x5)</h2>
-    <div class="drawer" id="drawerGrid"></div>
-    <div class="btn-group">
-        <button onclick="clearDrawer()">清空画板</button>
-        <button class="action" onclick="saveToLibrary()">⭐ 存入图鉴</button>
-        <button class="primary" onclick="pushToQueueFromDrawer()">加队列 ⬇</button>
+    <div id="labFeaturesContainer" style="display: none;">
+        <h2>2. 方块建模绘制 (5x5)</h2>
+        <div class="drawer" id="drawerGrid"></div>
+        <div class="btn-group">
+            <button onclick="clearDrawer()">清空画板</button>
+            <button class="action" onclick="saveToLibrary()">⭐ 存入图鉴</button>
+            <button class="primary" onclick="pushToQueueFromDrawer()">加队列 ⬇</button>
+        </div>
+        
+        <h2>3. 常用图鉴库 (点击入列)</h2>
+        <div class="library-container" id="patternLibrary"></div>
     </div>
-    
-    <h2>3. 常用图鉴库 (点击入列)</h2>
-    <div class="library-container" id="patternLibrary"></div>
     
     <h2>4. 本回合预备队列</h2>
     <div class="queue-container" id="queueSlots"></div>
@@ -285,11 +316,15 @@
                 // 只有在非播放模式下才允许手动修改棋盘
                 if(!isPlaying) {
                     cell.onclick = () => {
+                        const chk = document.getElementById('chkLabFeatures');
+                        if (!chk || !chk.checked) return;
                         targetBoard[r][c] = targetBoard[r][c] > 0 ? 0 : 1;
                         renderBoard();
                     };
                     cell.oncontextmenu = (e) => {
                         e.preventDefault();
+                        const chk = document.getElementById('chkLabFeatures');
+                        if (!chk || !chk.checked) return;
                         const cur = Number(targetBoard[r][c] || 0);
                         targetBoard[r][c] = (cur + 1) % 4;
                         renderBoard();
@@ -428,11 +463,11 @@
     }
 
     // --- CV 视觉引擎逻辑 ---
-    async function setCaptureBbox() {
+    async function setCaptureBbox(count) {
         const logEl = document.getElementById('log');
-        logEl.innerHTML += "[系统] 正在呼出全屏框选层...\n";
+        logEl.innerHTML += `[系统] 正在呼出全屏框选层（${count}区）...\n`;
         try {
-            const res = await fetch('http://127.0.0.1:8000/api/set_bbox');
+            const res = await fetch(`http://127.0.0.1:8000/api/set_bbox/${count}`);
             const data = await res.json();
             if(data.status === 'success') {
                 logEl.innerHTML += `✅ ${data.msg}\n`;
@@ -468,11 +503,21 @@
     function renderSettings(settings) {
         document.getElementById('chkTmpDebug').checked = !!settings.tmp_debug_enabled;
         document.getElementById('chkPerfAnalysis').checked = !!settings.perf_analysis_enabled;
+        document.getElementById('chkRecordData').checked = !!settings.record_data_enabled;
+        document.getElementById('chkLabFeatures').checked = !!settings.lab_features_enabled;
+        document.getElementById('labFeaturesContainer').style.display = settings.lab_features_enabled ? 'block' : 'none';
+        document.getElementById('boardEditHint').style.display = settings.lab_features_enabled ? 'block' : 'none';
         const profile = (settings.timing_profile || 'safe').toLowerCase();
         document.querySelectorAll('input[name="timingProfile"]').forEach(radio => {
             radio.checked = (radio.value === profile);
         });
-        document.getElementById('savedCaptureBbox').innerText = formatBboxText(settings.current_bbox);
+        const count = String(settings.candidate_count || 3);
+        document.querySelectorAll('input[name="candidateCount"]').forEach(radio => {
+            radio.checked = (radio.value === count);
+        });
+        document.getElementById('savedBbox4').innerText = formatBboxText(settings.bbox_4);
+        document.getElementById('savedBbox3').innerText = formatBboxText(settings.bbox_3);
+        document.getElementById('savedBbox2').innerText = formatBboxText(settings.bbox_2);
         document.getElementById('savedBoardBbox').innerText = formatBboxText(settings.board_bbox);
     }
 
@@ -574,6 +619,56 @@
         }
     }
 
+    async function onToggleRecordData() {
+        const logEl = document.getElementById('log');
+        const enabled = document.getElementById('chkRecordData').checked;
+        try {
+            const res = await fetch('http://127.0.0.1:8000/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ record_data_enabled: enabled })
+            });
+            const data = await res.json();
+            if(data.status === 'success' && data.settings) {
+                renderSettings(data.settings);
+                logEl.innerHTML += enabled
+                    ? '[系统] 已开启数据收集模式：后续推导数据将写入 dataset/turn_history.jsonl。\n'
+                    : '[系统] 已关闭数据收集模式。\n';
+            } else {
+                logEl.innerHTML += `❌ 数据收集设置保存失败: ${data.msg || '未知错误'}\n`;
+                await loadSettings(false);
+            }
+        } catch(e) {
+            logEl.innerHTML += `🚨 数据收集设置网络错误: ${e.message}\n`;
+            await loadSettings(false);
+        }
+    }
+
+    async function onToggleLabFeatures() {
+        const logEl = document.getElementById('log');
+        const enabled = document.getElementById('chkLabFeatures').checked;
+        try {
+            const res = await fetch('http://127.0.0.1:8000/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ lab_features_enabled: enabled })
+            });
+            const data = await res.json();
+            if(data.status === 'success' && data.settings) {
+                renderSettings(data.settings);
+                logEl.innerHTML += enabled
+                    ? '[系统] 已开启实验室功能（可开启右键手动编辑棋盘、自定义制图）。\n'
+                    : '[系统] 已关闭实验室功能。\n';
+            } else {
+                logEl.innerHTML += `❌ 实验室功能设置保存失败: ${data.msg || '未知错误'}\n`;
+                await loadSettings(false);
+            }
+        } catch(e) {
+            logEl.innerHTML += `🚨 实验室功能设置网络错误: ${e.message}\n`;
+            await loadSettings(false);
+        }
+    }
+
     async function onChangeTimingProfile() {
         const logEl = document.getElementById('log');
         const selected = document.querySelector('input[name="timingProfile"]:checked');
@@ -596,6 +691,26 @@
         } catch(e) {
             logEl.innerHTML += `🚨 执行器模式设置网络错误: ${e.message}\n`;
             await loadSettings(false);
+        }
+    }
+
+    async function onChangeCandidateCount() {
+        const logEl = document.getElementById('log');
+        const selected = document.querySelector('input[name="candidateCount"]:checked');
+        if (!selected) return;
+        try {
+            const res = await fetch('http://127.0.0.1:8000/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ candidate_count: parseInt(selected.value) })
+            });
+            const data = await res.json();
+            if(data.status === 'success' && data.settings) {
+                renderSettings(data.settings);
+                logEl.innerHTML += `[系统] 当前候选数已切换为 ${selected.value} 区。\n`;
+            }
+        } catch(e) {
+            logEl.innerHTML += `🚨 设置切换网络错误: ${e.message}\n`;
         }
     }
 
@@ -727,6 +842,11 @@
                 logEl.innerHTML += `✅ 代理完成第 ${agent.cycle_count} 轮自动执行。\n`;
                 appendPerfLog(`代理第 ${agent.cycle_count} 轮`, agent.last_profile);
                 lastAgentCycle = agent.cycle_count;
+            }
+
+            if(agent.last_board && !isPlaying) {
+                boardState = agent.last_board;
+                renderBoard();
             }
 
             if(agent.last_error && agent.last_error !== lastAgentError) {
