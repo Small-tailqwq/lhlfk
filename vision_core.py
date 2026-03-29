@@ -698,14 +698,25 @@ def _detect_blocks_in_crop(crop_img, debug_run_id, slot_idx, tail_img=None):
     if not raw_blobs:
         return []
 
-    base_side = float(np.median([min(b['w'], b['h']) for b in raw_blobs]))
+    expected_side = img_w / 5.0
+    raw_base = float(np.median([min(b['w'], b['h']) for b in raw_blobs])) if raw_blobs else expected_side
+    if raw_base > expected_side * 1.5 or raw_base < expected_side * 0.5:
+        base_side = expected_side
+    else:
+        base_side = raw_base
+
     recovered_blobs = _recover_square_from_low_fill_strips(mask, raw_blobs, rejected_blobs, base_side)
     if recovered_blobs:
         raw_blobs.extend(recovered_blobs)
 
     _save_tmp_step(debug_run_id, f"04_slot{slot_idx}_raw_blobs", _draw_blob_debug(crop_img, raw_blobs))
 
-    base_side = float(np.median([min(b['w'], b['h']) for b in raw_blobs]))
+    raw_base = float(np.median([min(b['w'], b['h']) for b in raw_blobs])) if raw_blobs else expected_side
+    if raw_base > expected_side * 1.5 or raw_base < expected_side * 0.5:
+        base_side = expected_side
+    else:
+        base_side = raw_base
+
     merge_ratio = 1.45
     cell_candidates = []
 
@@ -721,8 +732,27 @@ def _detect_blocks_in_crop(crop_img, debug_run_id, slot_idx, tail_img=None):
         x, y, w, h = blob['x'], blob['y'], blob['w'], blob['h']
         side = max(w, h)
 
+        if w >= base_side * 1.5 and h >= base_side * 1.5:
+            split_c = max(1, int(round(w / base_side)))
+            split_r = max(1, int(round(h / base_side)))
+            step_x = w / split_c
+            step_y = h / split_r
+            for r in range(split_r):
+                for c in range(split_c):
+                    cx = int(round(x + (c + 0.5) * step_x))
+                    cy = int(round(y + (r + 0.5) * step_y))
+                    cell_x1 = int(round(x + c * step_x))
+                    cell_y1 = int(round(y + r * step_y))
+                    cell_x2 = int(round(x + (c + 1) * step_x))
+                    cell_y2 = int(round(y + (r + 1) * step_y))
+                    roi = mask[cell_y1:cell_y2, cell_x1:cell_x2]
+                    if roi.size > 0 and (roi > 0).mean() > 0.35:
+                        cell_candidates.append({"cx": cx, "cy": cy, "w": int(round(step_x)), "h": int(round(step_y))})
+            continue
+
         if abs(w - h) <= max(6, int(side * 0.25)):
-            cell_candidates.append({"cx": x + w // 2, "cy": y + h // 2, "w": w, "h": h})
+            if w <= base_side * 1.5:
+                cell_candidates.append({"cx": x + w // 2, "cy": y + h // 2, "w": w, "h": h})
             continue
 
         if w > h * merge_ratio and h >= base_side * 0.7:
@@ -808,30 +838,64 @@ def _detect_blocks_in_crop(crop_img, debug_run_id, slot_idx, tail_img=None):
     return _recover_vertical_tail_cell(crop_img, tail_img, squares, coords, base_side, debug_run_id, slot_idx)
 
 
-def extract_blocks_from_memory(bbox):
-    """静默截图，按框选长宽比自适应裁切 2/3/4 个候选区并识别归一化坐标。"""
-    pil_img = ImageGrab.grab(bbox=bbox)
-    img_np = np.array(pil_img)
-    img_cv2 = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
-    debug_run_id = _new_debug_run_id("blocks")
-    _save_debug_capture(img_cv2)
-    _save_tmp_step(debug_run_id, "01_capture_bgr", img_cv2)
-
+def _detect_crop_regions(img_cv2):
+    """通过图像水平色彩投影检测分离候补块槽位，适配任意拉伸误差与分辨率"""
     img_h, img_w = img_cv2.shape[:2]
-    slot_count, slot_h, gap_h, offset_y = _infer_slot_layout(img_h, img_w)
+    hsv = cv2.cvtColor(img_cv2, cv2.COLOR_BGR2HSV)
+    sat = hsv[:, :, 1]
+    val = hsv[:, :, 2]
+    
+    mask = np.where((sat > 70) & (val > 70), 255, 0).astype(np.uint8)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    mask = cv2.medianBlur(mask, 3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    
+    y_proj = mask.sum(axis=1) / 255.0
+    separator_mask = y_proj > img_w * 0.8
+    runs = _proj_runs(separator_mask)
+    
+    valid_sep_runs = [r for r in runs if r[1] - r[0] > max(5, int(img_h * 0.01))]
+    
+    slots_base = []
+    last_y = 0
+    for s, e in valid_sep_runs:
+        if s - last_y > max(20, int(img_h * 0.05)):
+            slots_base.append((last_y, s))
+        last_y = e
+    if img_h - last_y > max(20, int(img_h * 0.05)):
+        slots_base.append((last_y, img_h))
+        
+    if len(slots_base) in [2, 3, 4]:
+        regions = []
+        for sy1, sy2 in slots_base:
+            extra_h = int((sy2 - sy1) * 0.35)
+            y2_tail = min(sy2 + extra_h, img_h)
+            regions.append({"y1": sy1, "y2_base": sy2, "y2_tail": y2_tail})
+        return regions
+    else:
+        slot_count, slot_h, gap_h, offset_y = _infer_slot_layout(img_h, img_w)
+        extra_h = int(slot_h * 0.35)
+        regions = []
+        for i in range(slot_count):
+            y1 = int(round(offset_y + i * (slot_h + gap_h)))
+            y2_base = int(round(y1 + slot_h))
+            y2_tail = min(y2_base + extra_h, img_h)
+            regions.append({"y1": y1, "y2_base": y2_base, "y2_tail": y2_tail})
+        return regions
 
-    # 在全图上标注裁切线，方便调试
+
+def _extract_blocks_and_regions(img_cv2, debug_run_id):
+    img_h, img_w = img_cv2.shape[:2]
+    regions = _detect_crop_regions(img_cv2)
+    
     crop_vis = img_cv2.copy()
     final_blocks = []
 
-    # 仅将下方 tail 作为“4x1->5x1”补偿输入，主识别仍使用纯正方形候选区，避免污染。
-    extra_h = int(slot_h * 0.35)
+    for i, slot in enumerate(regions):
+        y1 = slot["y1"]
+        y2_base = slot["y2_base"]
+        y2_tail = slot["y2_tail"]
 
-    for i in range(slot_count):
-        y1 = int(round(offset_y + i * (slot_h + gap_h)))
-        y2_base = int(round(y1 + slot_h))
-        y2_tail = min(y2_base + extra_h, img_h)
-        # 调试图：原始 slot 边界用青色，tail 区用橙色
         cv2.rectangle(crop_vis, (0, y1), (img_w - 1, y2_base), (0, 255, 255), 2)
         cv2.rectangle(crop_vis, (0, y2_base), (img_w - 1, y2_tail), (0, 128, 255), 1)
         cv2.putText(crop_vis, f"slot{i}", (4, y1 + 20),
@@ -846,27 +910,46 @@ def extract_blocks_from_memory(bbox):
         final_blocks.append(blocks)
 
     _save_tmp_step(debug_run_id, "06_crop_regions", crop_vis)
+    return final_blocks, regions
 
+
+def extract_blocks_from_memory(bbox):
+    """静默截图，自适应裁切候选区并识别归一化坐标。"""
+    pil_img = ImageGrab.grab(bbox=bbox)
+    img_np = np.array(pil_img)
+    img_cv2 = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    debug_run_id = _new_debug_run_id("blocks")
+    _save_debug_capture(img_cv2)
+    _save_tmp_step(debug_run_id, "01_capture_bgr", img_cv2)
+    
+    final_blocks, _ = _extract_blocks_and_regions(img_cv2, debug_run_id)
     return final_blocks
 
 
 def extract_blocks_with_screen_points(bbox):
     """兼容执行器接口：返回每个槽位的方块坐标与屏幕点位。"""
-    blocks = extract_blocks_from_memory(bbox)
-
     x1, y1, x2, y2 = [int(v) for v in bbox]
     cap_w = max(1, x2 - x1)
-    cap_h = max(1, y2 - y1)
-    slot_count, slot_h, gap_h, offset_y = _infer_slot_layout(cap_h, cap_w)
+    
+    pil_img = ImageGrab.grab(bbox=bbox)
+    img_np = np.array(pil_img)
+    img_cv2 = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
+    debug_run_id = _new_debug_run_id("blocks")
+    _save_debug_capture(img_cv2)
+    _save_tmp_step(debug_run_id, "01_capture_bgr", img_cv2)
+
+    blocks, regions = _extract_blocks_and_regions(img_cv2, debug_run_id)
 
     # UI 中单格最大可达 5 格，使用 slot 宽度/5 估算中心步长。
     cell_step = cap_w / 5.0
     slot_details = []
 
-    for i in range(slot_count):
-        sy1 = int(round(y1 + offset_y + i * (slot_h + gap_h)))
-        sy2 = int(round(sy1 + slot_h))
+    for i, slot in enumerate(regions):
+        sy1 = int(round(y1 + slot["y1"]))
+        sy2 = int(round(y1 + slot["y2_base"]))
         slot_bbox = [x1, sy1, x2, sy2]
+        
+        slot_h = slot["y2_base"] - slot["y1"]
 
         coords = blocks[i] if i < len(blocks) else []
         coords = [[int(r), int(c)] for r, c in coords]
@@ -887,7 +970,6 @@ def extract_blocks_with_screen_points(bbox):
                 px = int(round(origin_x + c * cell_step))
                 py = int(round(origin_y + r * cell_step))
 
-                # 限制到 slot 范围内，避免极端情况下越界。
                 px = max(x1, min(px, x2 - 1))
                 py = max(sy1, min(py, sy2 - 1))
                 cell_points.append({"row": int(r), "col": int(c), "x": px, "y": py})
