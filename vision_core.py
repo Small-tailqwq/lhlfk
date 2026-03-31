@@ -135,60 +135,69 @@ def extract_board_from_memory(bbox):
 
             state = 0
             if fill_gray > 0.22 and fill_colored < 0.18:
-                state = 2
+                state = 4  # 不可消除灯色占位块
             elif fill_colored > 0.20:
-                # 二次块的主要特征是裂纹纹理与高光对比，不依赖具体颜色。
-                texture_std = 0.0
-                val_std = 0.0
-                bright_ratio = 0.0
-                dark_ratio = 0.0
-                edge_density = 0.0
-                top_dark_ratio = 0.0
-                top_fill = 1.0
+                # 二元化检测：玻璃泡泡高光覆盖率（完全颜色无关！）
+                # 普通块没有玻璃高光（bright_ratio≈¯0），耐久块有玻璃泡泡社盖
+                # bright_ratio = （亮度>220 且 饱和度<150）的像素占比 = 接近白色的高光区域
+                bright_ratio = float(np.mean((roi_val > 220) & (roi_sat < 150))) if roi_sat.size > 0 else 0.0
 
-                if roi_bgr.size > 0:
-                    roi_gray_img = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
-                    lap = cv2.Laplacian(roi_gray_img, cv2.CV_32F)
-                    texture_std = float(np.std(lap))
-                    edge_density = float(np.mean(np.abs(lap) > 18.0))
-                if roi_val.size > 0:
-                    val_std = float(np.std(roi_val))
-                if roi_val.size > 0 and roi_sat.size > 0:
-                    bright_ratio = float(np.mean((roi_val > 220) & (roi_sat < 150)))
-                    dark_ratio = float(np.mean(roi_val < 130))
-                    top_h = max(1, roi_val.shape[0] // 2)
-                    top_dark_ratio = float(np.mean((roi_val[:top_h, :] < 132) & (roi_sat[:top_h, :] < 185)))
-
+                # top_gap: colored_strict在顶部半轰的缺失率，即玻璃泡泡高光另一视角
                 feature_mask = colored_strict[fy1:fy2, fx1:fx2]
-                if feature_mask.size > 0:
-                    top_h_mask = max(1, feature_mask.shape[0] // 2)
-                    top_fill = float(np.mean(feature_mask[:top_h_mask, :]))
-
-                contrast_mix = bright_ratio * dark_ratio
-                crack_gap = max(0.0, fill_durable_hint - fill_colored)
+                top_h_mask = max(1, feature_mask.shape[0] // 2)
+                top_fill = float(np.mean(feature_mask[:top_h_mask, :])) if feature_mask.size > 0 else 1.0
                 top_gap = max(0.0, 1.0 - top_fill)
 
-                durable_score = (
-                    min(texture_std / 75.0, 1.0) * 0.35
-                    + min(val_std / 70.0, 1.0) * 0.25
-                    + min(edge_density / 0.35, 1.0) * 0.25
-                    + min(contrast_mix / 0.08, 1.0) * 0.15
-                )
-                crack_score = min(crack_gap / 0.12, 1.0) * 0.55 + min(top_gap / 0.30, 1.0) * 0.45
-                heatmap_durable[y1:y2, x1:x2] = max(durable_score, crack_score)
-
-                if (
-                    fill_durable_hint > 0.20
-                    and (
-                        (crack_gap > 0.072 and top_gap > 0.16)
-                        or (crack_gap > 0.060 and top_gap > 0.20)
-                        or (texture_std > 13.0 and val_std > 15.0 and edge_density > 0.06 and contrast_mix > 0.004 and durable_score > 0.34)
-                        or (texture_std > 11.0 and top_dark_ratio > 0.035 and durable_score > 0.31)
-                    )
-                ):
-                    state = 3
+                if bright_ratio > 0.30 and top_gap > 0.12:  # 双重验证：有玻璃高光 且 顶部有透明缺口
+                    # 特殊得分块虽然bright_ratio可能偏高，但top_gap接近0（顶部是实心的）
+                    # 耐久块由于玻璃泡泡效应top_gap >= 0.22，安全边际足够。
+                    if bright_ratio > 0.65 or top_gap > 0.28:  # 亮度覆盖更大 + 顶部空洞更大 = 三次块
+                        state = 3
+                    else:
+                        state = 2  # 二次块
                 else:
-                    state = 1
+                    # 尝试旧式裂纹块识别路径（兑容旧版冰块）
+                    texture_std = 0.0
+                    val_std = 0.0
+                    edge_density = 0.0
+                    top_dark_ratio = 0.0
+                    crack_gap = max(0.0, fill_durable_hint - fill_colored)
+
+                    if roi_bgr.size > 0:
+                        roi_gray_img = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+                        lap = cv2.Laplacian(roi_gray_img, cv2.CV_32F)
+                        texture_std = float(np.std(lap))
+                        edge_density = float(np.mean(np.abs(lap) > 18.0))
+                    if roi_val.size > 0:
+                        val_std = float(np.std(roi_val))
+                        top_h = max(1, roi_val.shape[0] // 2)
+                        top_dark_ratio = float(np.mean((roi_val[:top_h, :] < 132) & (roi_sat[:top_h, :] < 185)))
+
+                    dark_ratio = float(np.mean(roi_val < 130)) if roi_val.size > 0 else 0.0
+                    bright_r_old = float(np.mean((roi_val > 220) & (roi_sat < 150))) if roi_val.size > 0 else 0.0
+                    contrast_mix = bright_r_old * dark_ratio
+                    top_gap_old = max(0.0, 1.0 - top_fill) if 'top_fill' in dir() else 0.0
+                    durable_score = (
+                        min(texture_std / 75.0, 1.0) * 0.35
+                        + min(val_std / 70.0, 1.0) * 0.25
+                        + min(edge_density / 0.35, 1.0) * 0.25
+                        + min(contrast_mix / 0.08, 1.0) * 0.15
+                    )
+                    crack_score = min(crack_gap / 0.12, 1.0) * 0.55 + min(top_gap_old / 0.30, 1.0) * 0.45
+                    heatmap_durable[y1:y2, x1:x2] = max(durable_score, crack_score)
+
+                    if (
+                        fill_durable_hint > 0.20
+                        and (
+                            (crack_gap > 0.072 and top_gap_old > 0.16)
+                            or (crack_gap > 0.060 and top_gap_old > 0.20)
+                            or (texture_std > 13.0 and val_std > 15.0 and edge_density > 0.06 and contrast_mix > 0.004 and durable_score > 0.34)
+                            or (texture_std > 11.0 and top_dark_ratio > 0.035 and durable_score > 0.31)
+                        )
+                    ):
+                        state = 3
+                    else:
+                        state = 1
 
             row.append(state)
         board.append(row)
@@ -200,9 +209,10 @@ def extract_board_from_memory(bbox):
     # 最终棋盘可视化
     board_arr = np.array(board, dtype=np.uint8)
     board_img = np.zeros_like(board_arr, dtype=np.uint8)
-    board_img[board_arr == 1] = 170
-    board_img[board_arr == 2] = 220
-    board_img[board_arr == 3] = 255
+    board_img[board_arr == 1] = 85
+    board_img[board_arr == 2] = 170
+    board_img[board_arr == 3] = 220
+    board_img[board_arr == 4] = 255
     board_vis = cv2.resize(board_img, (w, h), interpolation=cv2.INTER_NEAREST)
     _save_tmp_step(debug_run_id, "05_board_binary", board_vis)
 
@@ -216,11 +226,13 @@ def extract_board_from_memory(bbox):
             x2 = int((c + 1) * cell_w)
             state = int(board[r][c])
             if state == 1:
-                color = (0, 220, 80)
+                color = (0, 220, 80)    # 绿 = 普通块
             elif state == 2:
-                color = (160, 160, 160)
+                color = (0, 165, 255)   # 橙 = 二次块
             elif state == 3:
-                color = (0, 165, 255)
+                color = (0, 60, 255)    # 红 = 三次块
+            elif state == 4:
+                color = (160, 160, 160) # 灰 = 不可消除
             else:
                 color = (60, 60, 60)
             cv2.rectangle(overlay, (x1, y1), (x2, y2), color, 1)
@@ -666,7 +678,8 @@ def _detect_blocks_in_crop(crop_img, debug_run_id, slot_idx, tail_img=None):
     kernel = np.ones((3, 3), dtype=np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
-    _em = 2
+    # 扩大边缘擦除区域(从固定2px改为动态比例)，防止由于空槽的边缘边框高光导致多个方块粘连成一个巨大的无效连通域
+    _em = max(5, int(img_w * 0.03))
     mask[:_em, :] = 0;  mask[-_em:, :] = 0
     mask[:, :_em] = 0;  mask[:, -_em:] = 0
     _save_tmp_step(debug_run_id, f"03_slot{slot_idx}_mask", mask)
@@ -852,10 +865,18 @@ def _detect_crop_regions(img_cv2):
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     
     y_proj = mask.sum(axis=1) / 255.0
-    separator_mask = y_proj > img_w * 0.8
+    # 真正的紫色分割带：宽度横跨≥80%，且连续高度≥1%图像高（至少8px）
+    # 这样可以排除单行宽色块（如1×5横条方块）被误判为分割线
+    separator_mask = y_proj > img_w * 0.80
     runs = _proj_runs(separator_mask)
+
+    min_sep_height = max(8, int(img_h * 0.01))
+    min_sep_y = img_w * 0.66  # 根据方块的高宽近似，最顶上的分隔带不可能在第一格(近似正方形)的中部偏上
     
-    valid_sep_runs = [r for r in runs if r[1] - r[0] > max(5, int(img_h * 0.01))]
+    valid_sep_runs = []
+    for r in runs:
+        if (r[1] - r[0] >= min_sep_height) and (r[0] >= min_sep_y):
+            valid_sep_runs.append(r)
     
     slots_base = []
     last_y = 0

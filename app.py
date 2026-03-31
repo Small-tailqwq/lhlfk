@@ -120,8 +120,9 @@ def _place_and_clear(board, piece, r, c):
 
     # 清行规则：
     # - 1(普通块) 被清除 -> 0
-    # - 2(不可消除块) 保持 2
-    # - 3(强化块) 第一次被清除 -> 1，第二次再清除才会消失
+    # - 2(二次块) 第一次被清除 -> 1，第二次才消失
+    # - 3(三次块) 第一次被清除 -> 2，第二次 -> 1，第三次消失
+    # - 4(不可消除块) 永远保持 4
     for row in range(8):
         for col in range(8):
             if not rows_to_clear[row] and not cols_to_clear[col]:
@@ -130,8 +131,10 @@ def _place_and_clear(board, piece, r, c):
             cell = new_board[idx]
             if cell == 1:
                 new_board[idx] = 0
-            elif cell == 3:
+            elif cell == 2:
                 new_board[idx] = 1
+            elif cell == 3:
+                new_board[idx] = 2
             
     return new_board, _get_clear_score(cleared_lines)
 
@@ -477,6 +480,7 @@ class SettingsUpdateRequest(BaseModel):
     record_data_enabled: Optional[bool] = None
     candidate_count: Optional[int] = None
     lab_features_enabled: Optional[bool] = None
+    agent_no_scan_board: Optional[bool] = None
 
 
 AGENT_LOCK = threading.Lock()
@@ -495,6 +499,7 @@ AGENT_STATE: Dict[str, Any] = {
     "stop_hotkey": "F8",
     "last_profile": None,
     "last_board": None,
+    "current_plan": None,
     "thread": None,
 }
 
@@ -508,6 +513,7 @@ BOARD_BBOX = None
 TIMING_PROFILE_CHOICE = "safe"
 PERF_ANALYSIS_ENABLED = False
 RECORD_DATA_ENABLED = False
+AGENT_NO_SCAN_BOARD = False
 
 def get_current_bbox():
     if CANDIDATE_COUNT == 4: return BBOX_4
@@ -538,6 +544,7 @@ def _save_settings():
         "record_data_enabled": bool(RECORD_DATA_ENABLED),
         "candidate_count": int(CANDIDATE_COUNT),
         "lab_features_enabled": bool(LAB_FEATURES_ENABLED),
+        "agent_no_scan_board": bool(AGENT_NO_SCAN_BOARD),
         "bbox_4": list(BBOX_4) if BBOX_4 else None,
         "bbox_3": list(BBOX_3) if BBOX_3 else None,
         "bbox_2": list(BBOX_2) if BBOX_2 else None,
@@ -547,7 +554,7 @@ def _save_settings():
 
 
 def _load_settings():
-    global PERF_ANALYSIS_ENABLED, TIMING_PROFILE_CHOICE, BBOX_4, BBOX_3, BBOX_2, CANDIDATE_COUNT, LAB_FEATURES_ENABLED, BOARD_BBOX, RECORD_DATA_ENABLED
+    global PERF_ANALYSIS_ENABLED, TIMING_PROFILE_CHOICE, BBOX_4, BBOX_3, BBOX_2, CANDIDATE_COUNT, LAB_FEATURES_ENABLED, BOARD_BBOX, RECORD_DATA_ENABLED, AGENT_NO_SCAN_BOARD
 
     if not SETTINGS_FILE.exists():
         set_tmp_debug_enabled(False)
@@ -568,6 +575,7 @@ def _load_settings():
 
     CANDIDATE_COUNT = int(data.get("candidate_count", 3))
     LAB_FEATURES_ENABLED = bool(data.get("lab_features_enabled", False))
+    AGENT_NO_SCAN_BOARD = bool(data.get("agent_no_scan_board", False))
     BBOX_4 = _normalize_bbox(data.get("bbox_4"))
     
     old_bbox = _normalize_bbox(data.get("current_bbox"))
@@ -783,6 +791,7 @@ def _agent_snapshot() -> Dict[str, Any]:
             "stop_hotkey": AGENT_STATE["stop_hotkey"],
             "last_profile": AGENT_STATE["last_profile"],
             "last_board": AGENT_STATE.get("last_board"),
+            "current_plan": AGENT_STATE.get("current_plan"),
         }
 
 
@@ -815,6 +824,7 @@ def _agent_worker(
                 return
 
         _set_agent_state(phase="running", countdown_left=0, last_msg="代理已启动，循环执行中。")
+        simulated_board = None
 
         while True:
             with AGENT_LOCK:
@@ -837,8 +847,11 @@ def _agent_worker(
                     raise RuntimeError("代理执行失败：缺少预备区或棋盘框选。")
 
                 board_started = time.perf_counter()
-                board = extract_board_from_memory(BOARD_BBOX)
-                _set_agent_state(last_board=board)
+                if AGENT_NO_SCAN_BOARD and simulated_board is not None:
+                    board = simulated_board
+                else:
+                    board = extract_board_from_memory(BOARD_BBOX)
+                _set_agent_state(last_board=board, current_plan=None)
                 board_ms = (time.perf_counter() - board_started) * 1000.0
 
                 blocks_started = time.perf_counter()
@@ -848,6 +861,9 @@ def _agent_worker(
                 solve_result = _solve_with_steps(board, blocks, source="agent", enable_profiling=PERF_ANALYSIS_ENABLED)
                 if solve_result.get("status") != "success":
                     raise RuntimeError(solve_result.get("msg", "推导失败"))
+                
+                # 推导成功后立即分发计划给 UI，以实现高亮效果
+                _set_agent_state(current_plan=solve_result["steps"])
 
                 execute_started = time.perf_counter()
                 execute_result = execute_solution_steps(
@@ -863,6 +879,11 @@ def _agent_worker(
                 execute_ms = (time.perf_counter() - execute_started) * 1000.0
                 if execute_result.get("status") != "success":
                     raise RuntimeError(execute_result.get("msg", "执行失败"))
+                
+                # 执行完毕后，提取最后一步的预测棋盘状态缓存，供免扫模式使用，并清除本轮前端计划
+                board_after_1d = solve_result["steps"][-1]["board_after"]
+                simulated_board = [[board_after_1d[r*8 + c] for c in range(8)] for r in range(8)]
+                _set_agent_state(current_plan=None, last_board=simulated_board)
 
                 cycle_profile = None
                 if PERF_ANALYSIS_ENABLED:
@@ -891,7 +912,7 @@ def _agent_worker(
                     AGENT_STATE["last_msg"] = f"第 {AGENT_STATE['cycle_count']} 轮完成。"
                     AGENT_STATE["last_profile"] = cycle_profile
             except KeyboardInterrupt as e:
-                _set_agent_state(last_error=str(e), last_msg="已成功响应紧急中止指令，正在退出本轮。")
+                _set_agent_state(last_error=str(e), last_msg="已成功响应紧急中止指令，正在退出本轮。", current_plan=None)
                 break
             except Exception as e:
                 _record_perf_log(
@@ -902,7 +923,7 @@ def _agent_worker(
                     },
                     PERF_ANALYSIS_ENABLED,
                 )
-                _set_agent_state(last_error=str(e), last_msg="本轮失败，将在等待后重试。")
+                _set_agent_state(last_error=str(e), last_msg="本轮失败，将在等待后重试。", current_plan=None)
 
             wait_sec = max(0.05, float(wait_ms) / 1000.0)
             waited = 0.0
@@ -1013,6 +1034,7 @@ def api_get_settings():
             "timing_profile": str(TIMING_PROFILE_CHOICE),
             "candidate_count": int(CANDIDATE_COUNT),
             "lab_features_enabled": bool(LAB_FEATURES_ENABLED),
+            "agent_no_scan_board": bool(AGENT_NO_SCAN_BOARD),
             "bbox_4": list(BBOX_4) if BBOX_4 else None,
             "bbox_3": list(BBOX_3) if BBOX_3 else None,
             "bbox_2": list(BBOX_2) if BBOX_2 else None,
@@ -1025,7 +1047,7 @@ def api_get_settings():
 @app.post("/api/settings")
 @app.put("/api/settings")
 def api_update_settings(req: SettingsUpdateRequest):
-    global PERF_ANALYSIS_ENABLED, TIMING_PROFILE_CHOICE, RECORD_DATA_ENABLED, CANDIDATE_COUNT, LAB_FEATURES_ENABLED
+    global PERF_ANALYSIS_ENABLED, TIMING_PROFILE_CHOICE, RECORD_DATA_ENABLED, CANDIDATE_COUNT, LAB_FEATURES_ENABLED, AGENT_NO_SCAN_BOARD
     
     if req.tmp_debug_enabled is not None:
         set_tmp_debug_enabled(bool(req.tmp_debug_enabled))
@@ -1037,6 +1059,8 @@ def api_update_settings(req: SettingsUpdateRequest):
         CANDIDATE_COUNT = int(req.candidate_count)
     if req.lab_features_enabled is not None:
         LAB_FEATURES_ENABLED = bool(req.lab_features_enabled)
+    if req.agent_no_scan_board is not None:
+        AGENT_NO_SCAN_BOARD = bool(req.agent_no_scan_board)
     if req.timing_profile is not None:
         choice = str(req.timing_profile).lower()
         if choice in ("safe", "balanced", "fast"):
@@ -1052,6 +1076,7 @@ def api_update_settings(req: SettingsUpdateRequest):
             "timing_profile": str(TIMING_PROFILE_CHOICE),
             "candidate_count": int(CANDIDATE_COUNT),
             "lab_features_enabled": bool(LAB_FEATURES_ENABLED),
+            "agent_no_scan_board": bool(AGENT_NO_SCAN_BOARD),
             "bbox_4": list(BBOX_4) if BBOX_4 else None,
             "bbox_3": list(BBOX_3) if BBOX_3 else None,
             "bbox_2": list(BBOX_2) if BBOX_2 else None,
@@ -1069,14 +1094,16 @@ def api_recognize_board():
         started = time.perf_counter()
         board = extract_board_from_memory(BOARD_BBOX)
         filled = sum(1 for r in range(8) for c in range(8) if int(board[r][c]) > 0)
-        indestructible = sum(1 for r in range(8) for c in range(8) if int(board[r][c]) == 2)
-        durable = sum(1 for r in range(8) for c in range(8) if int(board[r][c]) == 3)
+        indestructible = sum(1 for r in range(8) for c in range(8) if int(board[r][c]) == 4)
+        durable_2 = sum(1 for r in range(8) for c in range(8) if int(board[r][c]) == 2)
+        durable_3 = sum(1 for r in range(8) for c in range(8) if int(board[r][c]) == 3)
         result = {
             "status": "success",
             "board": board,
             "filled_count": filled,
             "indestructible_count": indestructible,
-            "durable_count": durable,
+            "durable_2_count": durable_2,
+            "durable_3_count": durable_3,
         }
         if PERF_ANALYSIS_ENABLED:
             result["perf"] = {
@@ -1167,6 +1194,8 @@ def api_agent_start(req: AgentStartRequest):
             "timing_profile": req.timing_profile,
             "stop_hotkey": hotkey_name,
             "last_profile": None,
+            "last_board": None,
+            "current_plan": None,
             "thread": None,
         })
 

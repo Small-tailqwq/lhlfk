@@ -16,17 +16,30 @@
             background: linear-gradient(145deg, #8f9399 0%, #686d74 100%);
             box-shadow: inset 0 0 0 1px rgba(255,255,255,0.15), inset 0 0 10px rgba(0,0,0,0.35);
         }
-        .cell.type-durable {
+        .cell.type-durable-2 {
             background:
                 radial-gradient(circle at 75% 25%, rgba(255, 245, 205, 0.85) 0%, rgba(255, 245, 205, 0) 28%),
                 linear-gradient(145deg, #ffbe69 0%, #ff7f3a 52%, #ef5d2f 100%);
             box-shadow: inset 0 0 0 1px rgba(255,255,255,0.2), inset 0 0 10px rgba(123,39,0,0.35);
         }
-        .cell.type-durable::after {
+        .cell.type-durable-2::after {
             content: '';
             position: absolute;
             inset: 0;
             background: repeating-linear-gradient(130deg, rgba(255,255,255,0.05) 0 3px, rgba(0,0,0,0.08) 3px 6px);
+            pointer-events: none;
+        }
+        .cell.type-durable-3 {
+            background:
+                radial-gradient(circle at 75% 25%, rgba(255, 210, 210, 0.90) 0%, rgba(255, 210, 210, 0) 28%),
+                linear-gradient(145deg, #ff6b6b 0%, #e03030 52%, #b01010 100%);
+            box-shadow: inset 0 0 0 1px rgba(255,255,255,0.25), inset 0 0 12px rgba(80,0,0,0.45);
+        }
+        .cell.type-durable-3::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: repeating-linear-gradient(130deg, rgba(255,255,255,0.07) 0 3px, rgba(0,0,0,0.10) 3px 6px);
             pointer-events: none;
         }
         .cell-code {
@@ -69,7 +82,8 @@
         }
         .legend-normal { background: #ffd043; }
         .legend-indestructible { background: linear-gradient(145deg, #8f9399 0%, #686d74 100%); }
-        .legend-durable { background: linear-gradient(145deg, #ffbe69 0%, #ef5d2f 100%); }
+        .legend-durable-2 { background: linear-gradient(145deg, #ffbe69 0%, #ef5d2f 100%); }
+        .legend-durable-3 { background: linear-gradient(145deg, #ff6b6b 0%, #b01010 100%); }
         .board-stats {
             margin-bottom: 8px;
             font-size: 12px;
@@ -119,15 +133,16 @@
     <h2>1. 游戏主棋盘 (动态交互)</h2>
     <div class="board-legend">
         <span class="legend-item"><span class="legend-swatch legend-normal"></span>普通块 N(1)</span>
-        <span class="legend-item"><span class="legend-swatch legend-indestructible"></span>灰锁块 X(2)</span>
-        <span class="legend-item"><span class="legend-swatch legend-durable"></span>二次块 2(3)</span>
+        <span class="legend-item"><span class="legend-swatch legend-durable-2"></span>二次块 2</span>
+        <span class="legend-item"><span class="legend-swatch legend-durable-3"></span>三次块 3</span>
+        <span class="legend-item"><span class="legend-swatch legend-indestructible"></span>灰锁块 X(4)</span>
     </div>
-    <div class="board-stats" id="boardTypeStats">状态统计：N=0, X=0, 2次=0, 占用=0</div>
+    <div class="board-stats" id="boardTypeStats">状态统计：N=0, 2次=0, 3次=0, X=0, 占用=0</div>
     <div class="board" id="boardGrid"></div>
     <div class="btn-group" id="boardControls">
         <button onclick="clearBoard()">清空主棋盘</button>
     </div>
-    <p class="board-hint" id="boardEditHint" style="display: none;">左键切换空/普通块，右键循环 空→普通→灰锁→二次，用于核对识别类型。</p>
+    <p class="board-hint" id="boardEditHint" style="display: none;">左键切换空/普通块，右键循环 空→普通→二次→三次→灰锁，用于核对识别类型。</p>
     
     <div id="playbackPanel">
         <div class="step-indicator" id="stepInfo">准备回放...</div>
@@ -163,6 +178,10 @@
         <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:13px;">
             <input type="checkbox" id="chkRecordData" onchange="onToggleRecordData()" />
             收集求解数据 (turn_history.jsonl)
+        </label>
+        <label style="display:flex; align-items:center; gap:8px; margin-bottom:8px; font-size:13px;" title="仅在启动时扫描一次棋盘，后续使用计算机推演出的预测缓存，以加快计算和点击循环频率。请确保游戏进程本身没有受到不可抗力的画面异变影响。">
+            <input type="checkbox" id="chkNoScanBoard" onchange="onToggleNoScanBoard()" />
+            代理模式使用计算缓存
         </label>
         <div style="margin-bottom: 10px;">
             <label style="font-size: 13px; color: #c7d2e8; display: block; margin-bottom: 6px;">💠 当前游戏候选数：</label>
@@ -260,28 +279,31 @@
 
     function summarizeBoardStates(board) {
         let normal = 0;
+        let durable2 = 0;
+        let durable3 = 0;
         let indestructible = 0;
-        let durable = 0;
         for(let r=0; r<8; r++) {
             for(let c=0; c<8; c++) {
                 const s = Number(board[r][c] || 0);
                 if(s === 1) normal++;
-                else if(s === 2) indestructible++;
-                else if(s === 3) durable++;
+                else if(s === 2) durable2++;
+                else if(s === 3) durable3++;
+                else if(s === 4) indestructible++;
             }
         }
         return {
             normal,
+            durable2,
+            durable3,
             indestructible,
-            durable,
-            occupied: normal + indestructible + durable,
+            occupied: normal + durable2 + durable3 + indestructible,
         };
     }
 
     function updateBoardTypeStats(board = boardState) {
         if(!boardTypeStatsEl) return;
         const s = summarizeBoardStates(board);
-        boardTypeStatsEl.innerText = `状态统计：N=${s.normal}, X=${s.indestructible}, 2次=${s.durable}, 占用=${s.occupied}`;
+        boardTypeStatsEl.innerText = `状态统计：N=${s.normal}, 2次=${s.durable2}, 3次=${s.durable3}, X=${s.indestructible}, 占用=${s.occupied}`;
     }
 
     function renderBoard(customBoard = null, highlightCoords = []) {
@@ -301,15 +323,17 @@
                 } else if (state === 1) {
                     cell.classList.add('type-normal');
                 } else if (state === 2) {
-                    cell.classList.add('type-indestructible');
+                    cell.classList.add('type-durable-2');
                 } else if (state === 3) {
-                    cell.classList.add('type-durable');
+                    cell.classList.add('type-durable-3');
+                } else if (state === 4) {
+                    cell.classList.add('type-indestructible');
                 }
 
                 if(state > 0 && !isHighlight) {
                     const code = document.createElement('span');
                     code.className = 'cell-code';
-                    code.innerText = state === 1 ? 'N' : (state === 2 ? 'X' : '2');
+                    code.innerText = state === 1 ? 'N' : (state === 2 ? '2' : (state === 3 ? '3' : 'X'));
                     cell.appendChild(code);
                 }
 
@@ -326,7 +350,7 @@
                         const chk = document.getElementById('chkLabFeatures');
                         if (!chk || !chk.checked) return;
                         const cur = Number(targetBoard[r][c] || 0);
-                        targetBoard[r][c] = (cur + 1) % 4;
+                        targetBoard[r][c] = (cur + 1) % 5;
                         renderBoard();
                     };
                 }
@@ -504,6 +528,7 @@
         document.getElementById('chkTmpDebug').checked = !!settings.tmp_debug_enabled;
         document.getElementById('chkPerfAnalysis').checked = !!settings.perf_analysis_enabled;
         document.getElementById('chkRecordData').checked = !!settings.record_data_enabled;
+        document.getElementById('chkNoScanBoard').checked = !!settings.agent_no_scan_board;
         document.getElementById('chkLabFeatures').checked = !!settings.lab_features_enabled;
         document.getElementById('labFeaturesContainer').style.display = settings.lab_features_enabled ? 'block' : 'none';
         document.getElementById('boardEditHint').style.display = settings.lab_features_enabled ? 'block' : 'none';
@@ -644,6 +669,31 @@
         }
     }
 
+    async function onToggleNoScanBoard() {
+        const logEl = document.getElementById('log');
+        const enabled = document.getElementById('chkNoScanBoard').checked;
+        try {
+            const res = await fetch('http://127.0.0.1:8000/api/settings', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ agent_no_scan_board: enabled })
+            });
+            const data = await res.json();
+            if(data.status === 'success' && data.settings) {
+                renderSettings(data.settings);
+                logEl.innerHTML += enabled
+                    ? '[系统] 已开启“免扫缓存模式”：代理模式只在第一回合执行屏幕截取，后续直接复用推演出的预测棋盘。\n'
+                    : '[系统] 已关闭“免扫缓存模式”：代理模式每回合都会执行实时的物理环境截取。\n';
+            } else {
+                logEl.innerHTML += `❌ 免扫缓存设置保存失败: ${data.msg || '未知错误'}\n`;
+                await loadSettings(false);
+            }
+        } catch(e) {
+            logEl.innerHTML += `🚨 免扫缓存设置网络错误: ${e.message}\n`;
+            await loadSettings(false);
+        }
+    }
+
     async function onToggleLabFeatures() {
         const logEl = document.getElementById('log');
         const enabled = document.getElementById('chkLabFeatures').checked;
@@ -725,7 +775,7 @@
             if(data.status === 'success') {
                 boardState = data.board;
                 renderBoard();
-                logEl.innerHTML += `✅ 棋盘识别成功，耗时 ${costT} ms，占用 ${data.filled_count} 格（N约=${Math.max(0, data.filled_count - (data.indestructible_count || 0) - (data.durable_count || 0))} / X=${data.indestructible_count || 0} / 2次=${data.durable_count || 0}）。\n`;
+                logEl.innerHTML += `✅ 棋盘识别成功，耗时 ${costT} ms，占用 ${data.filled_count} 格（N约=${Math.max(0, data.filled_count - (data.indestructible_count || 0) - (data.durable_2_count || 0) - (data.durable_3_count || 0))} / 2次=${data.durable_2_count || 0} / 3次=${data.durable_3_count || 0} / X=${data.indestructible_count || 0}）。\n`;
                 appendPerfLog('棋盘识别', data.perf);
             } else {
                 logEl.innerHTML += `❌ ${data.msg}\n`;
@@ -844,9 +894,18 @@
                 lastAgentCycle = agent.cycle_count;
             }
 
-            if(agent.last_board && !isPlaying) {
+            if(agent.current_plan && agent.current_plan.length > 0 && !isPlaying) {
+                if(agent.last_board) boardState = agent.last_board;
+                let highlights = [];
+                agent.current_plan.forEach(step => {
+                    step.coords.forEach(pt => {
+                        highlights.push([pt[0] + step.place_row, pt[1] + step.place_col]);
+                    });
+                });
+                renderBoard(boardState, highlights);
+            } else if(agent.last_board && !isPlaying) {
                 boardState = agent.last_board;
-                renderBoard();
+                renderBoard(boardState, []);
             }
 
             if(agent.last_error && agent.last_error !== lastAgentError) {
