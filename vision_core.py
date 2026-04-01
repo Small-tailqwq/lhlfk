@@ -147,11 +147,46 @@ def extract_board_from_memory(bbox):
                 top_h_mask = max(1, feature_mask.shape[0] // 2)
                 top_fill = float(np.mean(feature_mask[:top_h_mask, :])) if feature_mask.size > 0 else 1.0
                 top_gap = max(0.0, 1.0 - top_fill)
+                top_third_h = max(1, feature_mask.shape[0] // 3) if feature_mask.size > 0 else 1
+                top_third_fill = float(np.mean(feature_mask[:top_third_h, :])) if feature_mask.size > 0 else 1.0
+                top_gap_third = max(0.0, 1.0 - top_third_fill)
+                right_top_gap = 0.0
+                left_top_gap = 0.0
+                top_gap_cols_ratio = 0.0
+                top_gap_longest_ratio = 0.0
+                if feature_mask.size > 0:
+                    top_half_mask = feature_mask[:top_h_mask, :]
+                    left_w = max(1, top_half_mask.shape[1] // 2)
+                    left_top_gap = max(0.0, 1.0 - float(np.mean(top_half_mask[:, :left_w])))
+                    right_top_gap = max(0.0, 1.0 - float(np.mean(top_half_mask[:, left_w:])))
+                    top_col_gap = 1.0 - np.mean(top_half_mask, axis=0)
+                    top_gap_cols = top_col_gap > 0.18
+                    top_gap_cols_ratio = float(np.mean(top_gap_cols)) if top_gap_cols.size > 0 else 0.0
+                    longest_gap_cols = 0
+                    current_gap_cols = 0
+                    for is_gap in top_gap_cols:
+                        if is_gap:
+                            current_gap_cols += 1
+                            if current_gap_cols > longest_gap_cols:
+                                longest_gap_cols = current_gap_cols
+                        else:
+                            current_gap_cols = 0
+                    top_gap_longest_ratio = float(longest_gap_cols / top_half_mask.shape[1]) if top_half_mask.shape[1] > 0 else 0.0
+
+                special_icon_triple = (
+                    bright_ratio > 0.34
+                    and 0.22 < top_gap < 0.28
+                    and top_gap_third > 0.30
+                    and right_top_gap > 0.37
+                    and left_top_gap < 0.12
+                    and top_gap_cols_ratio > 0.52
+                    and top_gap_longest_ratio > 0.44
+                )
 
                 if bright_ratio > 0.30 and top_gap > 0.12:  # 双重验证：有玻璃高光 且 顶部有透明缺口
                     # 特殊得分块虽然bright_ratio可能偏高，但top_gap接近0（顶部是实心的）
                     # 耐久块由于玻璃泡泡效应top_gap >= 0.22，安全边际足够。
-                    if bright_ratio > 0.65 or top_gap > 0.28:  # 亮度覆盖更大 + 顶部空洞更大 = 三次块
+                    if bright_ratio > 0.65 or top_gap > 0.28 or special_icon_triple:  # 亮度覆盖更大 + 顶部空洞更大 = 三次块
                         state = 3
                     else:
                         state = 2  # 二次块
